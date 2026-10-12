@@ -88,6 +88,22 @@ open class ImeEditor(
         ic.deleteSurroundingText(charsBefore, charsAfter)
     }
 
+    /**
+     * Replaces the [charsBefore] characters directly before the cursor with [text] in one batch edit and places the
+     * cursor [cursorOffset] characters after the end of the inserted text.
+     */
+    fun commitReplacingBefore(charsBefore: Int, text: String, cursorOffset: Int = 0): Boolean {
+        val ic = ic.get() ?: return false
+        ic.beginBatchEdit()
+        ic.finishComposingText()
+        if (charsBefore > 0) {
+            ic.deleteSurroundingText(charsBefore, 0)
+        }
+        ic.commitText(text, 1 + cursorOffset)
+        ic.endBatchEdit()
+        return true
+    }
+
     fun performClipboardCopy(): Boolean {
         val ic = ic.get() ?: return false
         return ic.performContextMenuAction(android.R.id.copy)

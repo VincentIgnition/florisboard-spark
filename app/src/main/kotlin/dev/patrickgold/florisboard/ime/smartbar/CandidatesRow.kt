@@ -120,9 +120,11 @@ fun CandidatesRow(modifier: Modifier = Modifier) {
                     candidate = candidate,
                     displayMode = displayMode,
                     onClick = {
+                        // Can't use candidate directly
+                        val candidateItem = candidates[n]
+                        nlpManager.notifySuggestionAccepted(candidateItem)
                         imeController.updateStateBlocking {
-                            // Can't use candidate directly
-                            emitCandidate(candidates[n])
+                            emitCandidate(candidateItem)
                         }
                     },
                     onLongPress = {

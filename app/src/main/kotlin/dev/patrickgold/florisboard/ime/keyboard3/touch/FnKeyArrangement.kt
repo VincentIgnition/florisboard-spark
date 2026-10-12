@@ -39,7 +39,7 @@ data class FnKeyArrangement(
 
     companion object {
         val Default = FnKeyArrangement(
-            simpleAction = FnKeyAction(ImeActions.SwitchToNextSubtype),
+            simpleAction = FnKeyAction(ImeActions.ShowMediaPanel),
             longPressActions = listOf(
                 FnKeyAction(ImeActions.ShowInputMethodPicker),
             ),

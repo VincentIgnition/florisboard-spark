@@ -116,6 +116,24 @@ data class WordSuggestionCandidate(
 }
 
 /**
+ * A word candidate that replaces [originalWord] automatically when the user ends the word with a space or
+ * punctuation. Remembers the original so a backspace right after the correction can restore it.
+ *
+ * @see SuggestionCandidate
+ */
+data class AutoCorrectionCandidate(
+    override val text: CharSequence,
+    val originalWord: String,
+    override val sourceProvider: SuggestionProvider?,
+) : SuggestionCandidate {
+    override val secondaryText: CharSequence? = null
+    override val confidence: Double = 1.0
+    override val isEligibleForAutoCommit: Boolean = true
+    override val isEligibleForUserRemoval: Boolean = true
+    override val icon: ImageVector? = null
+}
+
+/**
  * Default implementation for a clipboard candidate. Should generally not be used by a suggestion provider, except by
  * the clipboard suggestion provider.
  *

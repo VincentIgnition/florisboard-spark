@@ -48,7 +48,6 @@ import dev.patrickgold.jetpref.datastore.ui.Preference
 import dev.patrickgold.jetpref.datastore.ui.PreferenceGroup
 import dev.patrickgold.jetpref.datastore.ui.SwitchPreference
 import org.florisboard.lib.android.AndroidVersion
-import org.florisboard.lib.compose.FlorisErrorCard
 import org.florisboard.lib.compose.stringRes
 
 @Composable
@@ -77,14 +76,6 @@ fun TypingScreen() = FlorisScreen {
             )
         }
 
-        // This card is temporary and is therefore not using a string resource (not so temporary as we thought...)
-        FlorisErrorCard(
-            modifier = Modifier.padding(8.dp).padding(top = 32.dp),
-            text = """
-                Suggestions (except system autofill) and spell checking are not available in this release.
-            """.trimIndent().replace('\n', ' '),
-        )
-
         PreferenceGroup(title = stringRes(R.string.pref__suggestion__title)) {
             SwitchPreference(
                 prefs.suggestion.enabled,
@@ -112,6 +103,12 @@ fun TypingScreen() = FlorisScreen {
         }
 
         PreferenceGroup(title = stringRes(R.string.pref__correction__title)) {
+            SwitchPreference(
+                prefs.correction.autoCorrect,
+                title = stringRes(R.string.pref__correction__auto_correct__label),
+                summary = stringRes(R.string.pref__correction__auto_correct__summary),
+                enabledIf = { prefs.suggestion.enabled isEqualTo true },
+            )
             val isAutoSpacePunctuationEnabled by prefs.correction.autoSpacePunctuation.collectAsState()
             SwitchPreference(
                 prefs.correction.autoSpacePunctuation,

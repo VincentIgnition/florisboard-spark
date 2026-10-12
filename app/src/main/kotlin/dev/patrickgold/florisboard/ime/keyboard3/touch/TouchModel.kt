@@ -192,6 +192,25 @@ private fun FnKeyAction.asK3Key(): K3Key {
     )
 }
 
+private fun arrowKey(id: String, action: K3Descriptor): K3Key {
+    return K3Key(
+        id = K3KeyId(id),
+        output = action,
+        width = 2.5,
+        origin = TouchModelComputeRef,
+    )
+}
+
+/** SwiftKey style cursor row: left, up, down, right, each a quarter of the keyboard width. */
+private val ArrowRowKeys: List<K3Key> by lazy {
+    listOf(
+        arrowKey("arrow-row-left", ImeActions.ArrowLeft),
+        arrowKey("arrow-row-up", ImeActions.ArrowUp),
+        arrowKey("arrow-row-down", ImeActions.ArrowDown),
+        arrowKey("arrow-row-right", ImeActions.ArrowRight),
+    )
+}
+
 private fun computeTouchKeyboard(
     model: K3Model,
     layersGroup: K3TouchLayers,
@@ -207,8 +226,11 @@ private fun computeTouchKeyboard(
         } else null
     } else null
 
+    val arrowRow = if (options.showArrowRow) ArrowRowKeys else null
+
     val rowCount = layers.maxOf { (_, layer) -> layer.rows.size }.coerceAtLeast(4) +
-        if (numberRow != null) 1 else 0
+        (if (numberRow != null) 1 else 0) +
+        (if (arrowRow != null) 1 else 0)
 
     val touchLayers = buildMap {
         for ((_, layer) in layers) {
@@ -223,6 +245,9 @@ private fun computeTouchKeyboard(
                 }
                 layer.rows.forEach { row ->
                     add(row.withKeysResolved(model, keyPredicate))
+                }
+                if (arrowRow != null && layer.id != ImeLayerIds.Numpad && layer.id != ImeLayerIds.Telpad) {
+                    add(arrowRow)
                 }
             }
             val keyHeight = 1f / rows.size

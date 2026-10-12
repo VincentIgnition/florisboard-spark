@@ -86,6 +86,11 @@ fun KeyboardScreen() = FlorisScreen {
             title = stringRes(R.string.pref__keyboard__number_row__label),
             summary = stringRes(R.string.pref__keyboard__number_row__summary),
         )
+        SwitchPreference(
+            prefs.keyboard.arrowRow,
+            title = stringRes(R.string.pref__keyboard__arrow_row__label),
+            summary = stringRes(R.string.pref__keyboard__arrow_row__summary),
+        )
         Preference(
             title = stringRes(R.string.settings__fn_key__title),
             summary = stringRes(R.string.settings__fn_key__summary),

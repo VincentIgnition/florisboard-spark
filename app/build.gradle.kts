@@ -17,6 +17,7 @@
 import com.android.build.api.dsl.ApplicationExtension
 import org.gradle.api.tasks.testing.logging.TestLogEvent
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
+import java.util.Properties
 
 plugins {
     alias(libs.plugins.agp.application)
@@ -96,6 +97,21 @@ configure<ApplicationExtension> {
         compose = true
     }
 
+    signingConfigs {
+        // Credentials live in the git-ignored keystore.properties next to the git-ignored keystore/personal.jks
+        val keystoreProps = Properties().apply {
+            val file = rootProject.file("keystore.properties")
+            if (file.exists()) file.inputStream().use { load(it) }
+        }
+        create("personal") {
+            storeFile = rootProject.file(keystoreProps.getProperty("storeFile", "keystore/personal.jks"))
+            storeType = "PKCS12"
+            storePassword = keystoreProps.getProperty("storePassword")
+            keyAlias = keystoreProps.getProperty("keyAlias", "personal")
+            keyPassword = keystoreProps.getProperty("keyPassword")
+        }
+    }
+
     buildTypes {
         named("debug") {
             applicationIdSuffix = ".debug"
@@ -129,6 +145,16 @@ configure<ApplicationExtension> {
             versionNameSuffix = "-bench+${getGitCommitHash(short = true).get()}"
 
             signingConfig = signingConfigs.getByName("debug")
+            matchingFallbacks += listOf("release")
+        }
+
+        create("personal") {
+            initWith(getByName("release"))
+
+            applicationIdSuffix = ".personal"
+            versionNameSuffix = "-suggestions+${getGitCommitHash(short = true).get()}"
+
+            signingConfig = signingConfigs.getByName("personal")
             matchingFallbacks += listOf("release")
         }
     }

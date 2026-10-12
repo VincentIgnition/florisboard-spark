@@ -435,6 +435,10 @@
     <string name="settings__keyboard__title" comment="Title of Keyboard preferences screen">Keyboard</string>
     <string name="pref__keyboard__number_row__label" comment="Preference title">Number row</string>
     <string name="pref__keyboard__number_row__summary" comment="Preference summary">Show a number row above the character layout</string>
+    <string name="pref__correction__auto_correct__label" comment="Preference title">Auto-correct</string>
+    <string name="pref__correction__auto_correct__summary" comment="Preference summary">Fix obvious typos when you press space or punctuation. Press backspace right after to undo.</string>
+    <string name="pref__keyboard__arrow_row__label" comment="Preference title">Arrow key row</string>
+    <string name="pref__keyboard__arrow_row__summary" comment="Preference summary">Show a row of cursor arrow keys below the character layout</string>
     <string name="pref__keyboard__space_bar_mode__label" comment="Preference title">Spacebar label</string>
     <string name="pref__keyboard__font_size_multiplier__label" comment="Preference title">Font size multiplier</string>
     <string name="pref__keyboard__landscape_input_ui_mode__label" comment="Preference value">Landscape fullscreen input</string>

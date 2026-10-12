@@ -22,6 +22,7 @@ import android.text.TextUtils
 import android.view.KeyEvent
 import android.view.inputmethod.InputConnection
 import androidx.compose.runtime.staticCompositionLocalOf
+import dev.patrickgold.florisboard.FlorisApplication
 import dev.patrickgold.florisboard.FlorisImeService
 import dev.patrickgold.florisboard.app.FlorisPreferenceStore
 import dev.patrickgold.florisboard.ime.ImeUiMode
@@ -43,8 +44,11 @@ import dev.patrickgold.florisboard.ime.keyboard3.touch.TouchModelCache
 import dev.patrickgold.florisboard.ime.keyboard3.touch.TouchModelOptions
 import dev.patrickgold.florisboard.ime.media.emoji.EmojiSuggestionType
 import dev.patrickgold.florisboard.ime.nlp.BreakIterators
+import dev.patrickgold.florisboard.ime.nlp.AutoCorrectionCandidate
 import dev.patrickgold.florisboard.ime.nlp.ClipboardSuggestionCandidate
+import dev.patrickgold.florisboard.ime.nlp.EmojiSuggestionCandidate
 import dev.patrickgold.florisboard.ime.nlp.SuggestionCandidate
+import dev.patrickgold.florisboard.ime.nlp.latin.LatinTextAnalysis
 import dev.patrickgold.florisboard.ime.text.key.KeyVariation
 import dev.patrickgold.florisboard.lib.FlorisLocale
 import dev.patrickgold.florisboard.lib.devtools.flogDebug
@@ -89,6 +93,15 @@ class ImeController(
     private val breakIterators = BreakIterators()
     private val expectedContentQueue = ExpectedContentQueue()
 
+    /** The most recent auto-correction, undoable by a backspace pressed right after it. */
+    private var lastAutoCorrection: AppliedAutoCorrection? = null
+
+    private data class AppliedAutoCorrection(
+        val candidate: AutoCorrectionCandidate,
+        val separator: String,
+        val cursorAfter: Int,
+    )
+
     val activeTouchModelOptions = combine<Any, TouchModelOptions>(
         prefs.keyboard.numberRow.asFlow(),
         prefs.keyboard.fnKeyEnabled.asFlow(),
@@ -98,9 +111,11 @@ class ImeController(
         prefs.keyboard.multiTapHighlightEnabled.asFlow(),
         prefs.keyboard.flickKeyHintEnabled.asFlow(),
         prefs.keyboard.flickKeyHintPlacement.asFlow(),
+        prefs.keyboard.arrowRow.asFlow(),
     ) { values ->
         TouchModelOptions(
             showNumberRow = values[0] as Boolean,
+            showArrowRow = values[8] as Boolean,
             fnKeyEnabled = values[1] as Boolean,
             fnKeyArrangement = values[2] as FnKeyArrangement,
             longPressKeyHintEnabled = values[3] as Boolean,
@@ -286,6 +301,7 @@ class ImeController(
             )
             resetContent(initialSelection, initialSurrounding)
             expectedContentQueue.clear()
+            lastAutoCorrection = null
         }
 
         fun handleUpdateSelection(newSelection: K3TextRange) {
@@ -299,9 +315,77 @@ class ImeController(
         }
 
         override fun emitText(value: K3String) {
+            val applied = applyAutoCorrectionBefore(value.toText())
             super.emitText(value)
             expectedContentQueue.push(state.content)
             reevaluateInputShiftState()
+            lastAutoCorrection = applied?.copy(cursorAfter = state.content.selection.min)
+        }
+
+        /**
+         * If [separator] ends a word that has a pending auto-correction, replaces the word before the separator is
+         * inserted.
+         */
+        private fun applyAutoCorrectionBefore(separator: String): AppliedAutoCorrection? {
+            if (separator.length != 1 || separator[0] !in AUTO_CORRECT_SEPARATORS) return null
+            if (!prefs.correction.autoCorrect.get() || !prefs.suggestion.enabled.get()) return null
+            val info = state.editor.info
+            if (info.isRawInputEditor || info.inputAttributes.flagTextNoSuggestions) return null
+            when (state.flags.keyVariation) {
+                KeyVariation.PASSWORD, KeyVariation.EMAIL_ADDRESS, KeyVariation.URI -> return null
+                else -> {}
+            }
+            val content = state.content
+            val selection = content.selection
+            if (selection.isNotCollapsed()) return null
+            val textBefore = content.surroundingText.textBefore
+            val textAfter = content.surroundingText.textAfter
+            if (textAfter.isNotEmpty() && LatinTextAnalysis.isWordChar(textAfter[0])) return null
+            val currentWord = LatinTextAnalysis.currentWord(textBefore)
+            if (currentWord.isEmpty()) return null
+            val nlpManager = FlorisApplication.getHack().nlpManager.value
+            val candidate = nlpManager.getAutoCommitCandidate() as? AutoCorrectionCandidate ?: return null
+            // Suggestions are computed asynchronously, make sure this one belongs to the word being ended
+            if (candidate.originalWord != currentWord) return null
+            val corrected = candidate.text.toString()
+            nlpManager.notifySuggestionAccepted(candidate)
+            if (!state.editor.commitReplacingBefore(currentWord.length, corrected)) return null
+            resetContent(
+                K3TextRange(selection.min - currentWord.length + corrected.length),
+                K3SurroundingText(
+                    textBefore = textBefore.dropLast(currentWord.length) + corrected,
+                    textSelected = "",
+                    textAfter = textAfter,
+                ),
+            )
+            expectedContentQueue.push(state.content)
+            return AppliedAutoCorrection(candidate, separator, cursorAfter = -1)
+        }
+
+        /**
+         * Undoes [applied] if the cursor still sits right after the corrected word and its separator, restoring the
+         * word exactly as the user typed it.
+         */
+        private fun revertAutoCorrection(applied: AppliedAutoCorrection): Boolean {
+            val content = state.content
+            val selection = content.selection
+            if (selection.isNotCollapsed() || selection.min != applied.cursorAfter) return false
+            val textBefore = content.surroundingText.textBefore
+            val tail = applied.candidate.text.toString() + applied.separator
+            if (!textBefore.endsWith(tail)) return false
+            val original = applied.candidate.originalWord
+            if (!state.editor.commitReplacingBefore(tail.length, original)) return false
+            resetContent(
+                K3TextRange(selection.min - tail.length + original.length),
+                K3SurroundingText(
+                    textBefore = textBefore.dropLast(tail.length) + original,
+                    textSelected = "",
+                    textAfter = content.surroundingText.textAfter,
+                ),
+            )
+            expectedContentQueue.push(state.content)
+            FlorisApplication.getHack().nlpManager.value.notifySuggestionReverted(applied.candidate)
+            return true
         }
 
         override fun emitDescriptor(descriptor: K3Descriptor) {
@@ -378,8 +462,8 @@ class ImeController(
                 ImeActions.SwitchToPrevInputMethod -> FlorisImeService.switchToPrevInputMethod()
                 ImeActions.SwitchToNextInputMethod -> FlorisImeService.switchToNextInputMethod()
                 ImeActions.ShowSubtypePicker -> {} // TODO
-                ImeActions.SwitchToPrevSubtype -> {} // TODO
-                ImeActions.SwitchToNextSubtype -> {} // TODO
+                ImeActions.SwitchToPrevSubtype -> FlorisApplication.getHack().subtypeManager.value.switchToPrevSubtype()
+                ImeActions.SwitchToNextSubtype -> FlorisApplication.getHack().subtypeManager.value.switchToNextSubtype()
                 ImeActions.ToggleActionsEditor -> {
                     state = state.copy(
                         flags = state.flags
@@ -404,6 +488,11 @@ class ImeController(
         }
 
         override fun emitBackspace() {
+            val applied = lastAutoCorrection
+            lastAutoCorrection = null
+            if (applied != null && revertAutoCorrection(applied)) {
+                return
+            }
             super.emitBackspace()
             expectedContentQueue.push(state.content)
         }
@@ -499,23 +588,54 @@ class ImeController(
         fun emitCompletion(candidate: SuggestionCandidate): Boolean {
             val text = candidate.text.toString()
             if (text.isEmpty() || state.editor.info.isRawInputEditor) return false
-//            val content = activeContent
-//            return if (content.composing.isValid) {
-//                phantomSpace.setActive(showComposingRegion = false, candidate = candidate)
-//                super.finalizeComposingText(text)
-//            } else {
-//                val isPhantomSpaceActive = phantomSpace.determine(text)
-//                phantomSpace.setActive(showComposingRegion = false, candidate = candidate)
-//                return if (isPhantomSpaceActive) {
-//                    super.commitText("$SPACE$text")
-//                } else {
-//                    super.commitText(text)
-//                }.also {
-//                    // handled in finalizeComposingText if content.composing.isValid
-//                    updateLastCommitPosition()
-//                }
-//            }
-            return false
+            val content = state.content
+            val selection = content.selection
+            if (selection.isNotCollapsed()) return false
+            val textBefore = content.surroundingText.textBefore
+            val textAfter = content.surroundingText.textAfter
+
+            val replaceLength: Int
+            val suffix: String
+            if (candidate is EmojiSuggestionCandidate) {
+                replaceLength = emojiQueryLength(textBefore)
+                suffix = ""
+            } else {
+                replaceLength = LatinTextAnalysis.currentWord(textBefore).length
+                suffix = if (textAfter.firstOrNull()?.isWhitespace() == true) "" else " "
+            }
+            // Step over an existing space instead of inserting a second one
+            val cursorOffset = if (suffix.isEmpty() && candidate !is EmojiSuggestionCandidate) 1 else 0
+            val insertText = text + suffix
+            if (!state.editor.commitReplacingBefore(replaceLength, insertText, cursorOffset)) return false
+
+            val newTextBefore = textBefore.dropLast(replaceLength) + insertText + textAfter.take(cursorOffset)
+            val newCursor = selection.min - replaceLength + insertText.length + cursorOffset
+            resetContent(
+                K3TextRange(newCursor),
+                K3SurroundingText(
+                    textBefore = newTextBefore,
+                    textSelected = "",
+                    textAfter = textAfter.drop(cursorOffset),
+                ),
+            )
+            expectedContentQueue.push(state.content)
+            return true
+        }
+
+        /**
+         * Length of the ":query" an emoji suggestion was generated from, or 0 if there is none before the cursor.
+         */
+        private fun emojiQueryLength(textBefore: String): Int {
+            val prefix = EmojiSuggestionType.LEADING_COLON.prefix
+            var i = textBefore.length
+            while (i > 0 && (textBefore[i - 1].isLetterOrDigit() || textBefore[i - 1] == '_' || textBefore[i - 1] == '-')) {
+                i--
+            }
+            return if (prefix.isNotEmpty() && textBefore.startsWith(prefix, i - prefix.length)) {
+                textBefore.length - i + prefix.length
+            } else {
+                textBefore.length - i
+            }
         }
 
         override fun switchTouchLayer(newTouchLayerId: K3LayerId) {
@@ -628,6 +748,8 @@ class ImeController(
 
     companion object {
         private val NEWLINE_SEQ = "\n".asK3String()
+
+        private const val AUTO_CORRECT_SEPARATORS = " .,!?;:"
     }
 }
 

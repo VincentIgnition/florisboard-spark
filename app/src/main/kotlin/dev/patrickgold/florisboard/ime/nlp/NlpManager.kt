@@ -24,8 +24,11 @@ import dev.patrickgold.florisboard.clipboardManager
 import dev.patrickgold.florisboard.ime.clipboard.provider.ClipboardItem
 import dev.patrickgold.florisboard.ime.clipboard.provider.ItemType
 import dev.patrickgold.florisboard.ime.core.Subtype
+import dev.patrickgold.florisboard.ime.editor.InputAttributes
+import dev.patrickgold.florisboard.ime.keyboard3.ImeState
 import dev.patrickgold.florisboard.ime.media.emoji.EmojiSuggestionProvider
 import dev.patrickgold.florisboard.ime.nlp.latin.LatinLanguageProvider
+import dev.patrickgold.florisboard.ime.text.key.KeyVariation
 import dev.patrickgold.florisboard.inferFlorisApplication
 import dev.patrickgold.florisboard.lib.util.NetworkUtils
 import dev.patrickgold.florisboard.subtypeManager
@@ -34,12 +37,15 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import org.florisboard.lib.kotlin.guardedByLock
+import org.florisboard.lib.kotlin.collectIn
 import org.florisboard.lib.kotlin.collectLatestIn
 import org.k3lp.runtime.K3Content
 import org.k3lp.runtime.K3TextRange
@@ -100,6 +106,59 @@ class NlpManager(context: Context) {
         }
         subtypeManager.activeSubtypeFlow.collectLatestIn(scope) { subtype ->
             preload(subtype)
+        }
+        imeController.activeState
+            .map { state -> SuggestionRequest.of(state) }
+            .distinctUntilChanged { old, new -> old?.key == new?.key }
+            .collectIn(scope) { request ->
+                // Processed in order on purpose: providers learn from the sequence of editor states, and running
+                // requests concurrently would let a later keystroke finish before an earlier one
+                if (request == null) {
+                    clearSuggestions()
+                } else {
+                    computeSuggestions(
+                        subtype = subtypeManager.activeSubtype,
+                        content = request.content,
+                        isPrivateSession = request.isPrivateSession,
+                        reqTime = SystemClock.uptimeMillis(),
+                    )
+                }
+            }
+    }
+
+    /**
+     * Snapshot of the editor state relevant for suggestions, or null if suggestions must not be shown for the
+     * current editor (passwords, number fields, raw key editors, or fields that opt out of suggestions).
+     */
+    private class SuggestionRequest(
+        val content: K3Content,
+        val isPrivateSession: Boolean,
+        val key: String,
+    ) {
+        companion object {
+            fun of(state: ImeState): SuggestionRequest? {
+                val editor = state.editor
+                if (editor.ic.get() == null) return null
+                val info = editor.info
+                val attributes = info.inputAttributes
+                if (!info.isRichInputEditor ||
+                    attributes.type != InputAttributes.Type.TEXT ||
+                    attributes.flagTextNoSuggestions ||
+                    state.flags.keyVariation == KeyVariation.PASSWORD
+                ) {
+                    return null
+                }
+                val content = state.content
+                val surrounding = content.surroundingText
+                val key = buildString {
+                    append(content.selection.start).append(':').append(content.selection.end).append('|')
+                    append(surrounding.textBefore).append('\u0000')
+                    append(surrounding.textSelected).append('\u0000')
+                    append(surrounding.textAfter).append('|')
+                    append(state.flags.isIncognitoMode)
+                }
+                return SuggestionRequest(content, state.flags.isIncognitoMode, key)
+            }
         }
     }
 
@@ -191,41 +250,53 @@ class NlpManager(context: Context) {
             || prefs.emoji.suggestionEnabled.get()
             || providerForcesSuggestionOn(subtypeManager.activeSubtype)
 
-    fun suggest(subtype: Subtype, content: K3Content) {
+    fun suggest(subtype: Subtype, content: K3Content, isPrivateSession: Boolean = false) {
         val reqTime = SystemClock.uptimeMillis()
         scope.launch {
-            val emojiSuggestions = when {
-                prefs.emoji.suggestionEnabled.get() -> {
-                    emojiSuggestionProvider.suggest(
-                        subtype = subtype,
-                        content = content,
-                        maxCandidateCount = prefs.emoji.suggestionCandidateMaxCount.get(),
-                        allowPossiblyOffensive = !prefs.suggestion.blockPossiblyOffensive.get(),
-                        isPrivateSession = false // TODO keyboardManager.activeState.isIncognitoMode,
-                    )
-                }
-                else -> emptyList()
+            computeSuggestions(subtype, content, isPrivateSession, reqTime)
+        }
+    }
+
+    private suspend fun computeSuggestions(
+        subtype: Subtype,
+        content: K3Content,
+        isPrivateSession: Boolean,
+        reqTime: Long,
+    ) {
+        val emojiSuggestions = when {
+            prefs.emoji.suggestionEnabled.get() -> {
+                emojiSuggestionProvider.suggest(
+                    subtype = subtype,
+                    content = content,
+                    maxCandidateCount = prefs.emoji.suggestionCandidateMaxCount.get(),
+                    allowPossiblyOffensive = !prefs.suggestion.blockPossiblyOffensive.get(),
+                    isPrivateSession = isPrivateSession,
+                )
             }
-            val suggestions = when {
-                emojiSuggestions.isNotEmpty() && prefs.emoji.suggestionType.get().prefix.isNotEmpty() -> {
-                    emptyList()
-                }
-                else -> {
-                    getSuggestionProvider(subtype).suggest(
-                        subtype = subtype,
-                        content = content,
-                        maxCandidateCount = 8,
-                        allowPossiblyOffensive = !prefs.suggestion.blockPossiblyOffensive.get(),
-                        isPrivateSession = false // TODO keyboardManager.activeState.isIncognitoMode,
-                    )
-                }
+            else -> emptyList()
+        }
+        val suggestions = when {
+            emojiSuggestions.isNotEmpty() && prefs.emoji.suggestionType.get().prefix.isNotEmpty() -> {
+                emptyList()
             }
-            internalSuggestionsGuard.withLock {
-                if (internalSuggestions.first < reqTime) {
-                    internalSuggestions = reqTime to buildList {
-                        addAll(emojiSuggestions)
-                        addAll(suggestions)
-                    }
+            !prefs.suggestion.enabled.get() && !providerForcesSuggestionOn(subtype) -> {
+                emptyList()
+            }
+            else -> {
+                getSuggestionProvider(subtype).suggest(
+                    subtype = subtype,
+                    content = content,
+                    maxCandidateCount = 8,
+                    allowPossiblyOffensive = !prefs.suggestion.blockPossiblyOffensive.get(),
+                    isPrivateSession = isPrivateSession,
+                )
+            }
+        }
+        internalSuggestionsGuard.withLock {
+            if (internalSuggestions.first <= reqTime) {
+                internalSuggestions = reqTime to buildList {
+                    addAll(emojiSuggestions)
+                    addAll(suggestions)
                 }
             }
         }
@@ -242,6 +313,27 @@ class NlpManager(context: Context) {
         val reqTime = SystemClock.uptimeMillis()
         runBlocking {
             internalSuggestions = reqTime to emptyList()
+        }
+    }
+
+    /**
+     * Tells the candidate's provider it was picked. Must run before the candidate is committed, so the provider
+     * already knows about it when the resulting editor change triggers the next suggestion round.
+     */
+    fun notifySuggestionAccepted(candidate: SuggestionCandidate) {
+        val subtype = subtypeManager.activeSubtype
+        runBlocking {
+            candidate.sourceProvider?.notifySuggestionAccepted(subtype, candidate)
+        }
+    }
+
+    /**
+     * Tells the candidate's provider that its automatic commit was undone by the user.
+     */
+    fun notifySuggestionReverted(candidate: SuggestionCandidate) {
+        val subtype = subtypeManager.activeSubtype
+        runBlocking {
+            candidate.sourceProvider?.notifySuggestionReverted(subtype, candidate)
         }
     }
 

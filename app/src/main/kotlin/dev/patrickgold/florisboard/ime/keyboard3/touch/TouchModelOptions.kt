@@ -21,6 +21,7 @@ import dev.patrickgold.florisboard.ime.keyboard3.hint.LongPressKeyHintPlacement
 
 data class TouchModelOptions(
     val showNumberRow: Boolean,
+    val showArrowRow: Boolean,
     val fnKeyEnabled: Boolean,
     val fnKeyArrangement: FnKeyArrangement,
     val longPressKeyHintEnabled: Boolean,
@@ -32,6 +33,7 @@ data class TouchModelOptions(
     companion object {
         val Default = TouchModelOptions(
             showNumberRow = false,
+            showArrowRow = true,
             fnKeyEnabled = true,
             fnKeyArrangement = FnKeyArrangement.Default,
             longPressKeyHintEnabled = true,
