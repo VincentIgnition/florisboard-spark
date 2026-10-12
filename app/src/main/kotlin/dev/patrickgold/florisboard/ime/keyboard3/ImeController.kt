@@ -330,7 +330,11 @@ class ImeController(
             if (separator.length != 1 || separator[0] !in AUTO_CORRECT_SEPARATORS) return null
             if (!prefs.correction.autoCorrect.get() || !prefs.suggestion.enabled.get()) return null
             val info = state.editor.info
-            if (info.isRawInputEditor || info.inputAttributes.flagTextNoSuggestions) return null
+            val attributes = info.inputAttributes
+            if (attributes.suggestionsBlockedReason != null) return null
+            // In fields like browser address bars only a space confirms a correction, so that a "." inside a
+            // domain name never rewrites the word before it
+            if (attributes.requestsNoSuggestions && separator != " ") return null
             when (state.flags.keyVariation) {
                 KeyVariation.PASSWORD, KeyVariation.EMAIL_ADDRESS, KeyVariation.URI -> return null
                 else -> {}

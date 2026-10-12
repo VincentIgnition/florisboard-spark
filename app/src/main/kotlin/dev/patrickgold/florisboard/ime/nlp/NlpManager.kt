@@ -24,7 +24,6 @@ import dev.patrickgold.florisboard.clipboardManager
 import dev.patrickgold.florisboard.ime.clipboard.provider.ClipboardItem
 import dev.patrickgold.florisboard.ime.clipboard.provider.ItemType
 import dev.patrickgold.florisboard.ime.core.Subtype
-import dev.patrickgold.florisboard.ime.editor.InputAttributes
 import dev.patrickgold.florisboard.ime.keyboard3.ImeState
 import dev.patrickgold.florisboard.ime.media.emoji.EmojiSuggestionProvider
 import dev.patrickgold.florisboard.ime.nlp.latin.LatinLanguageProvider
@@ -141,13 +140,12 @@ class NlpManager(context: Context) {
                 if (editor.ic.get() == null) return null
                 val info = editor.info
                 val attributes = info.inputAttributes
-                if (!info.isRichInputEditor ||
-                    attributes.type != InputAttributes.Type.TEXT ||
-                    attributes.flagTextNoSuggestions ||
-                    state.flags.keyVariation == KeyVariation.PASSWORD
-                ) {
+                if (attributes.suggestionsBlockedReason != null || state.flags.keyVariation == KeyVariation.PASSWORD) {
                     return null
                 }
+                // Fields like browser address bars mostly see URLs and one-off searches, which would only pollute
+                // the learned words
+                val isPrivateSession = state.flags.isIncognitoMode || attributes.requestsNoSuggestions
                 val content = state.content
                 val surrounding = content.surroundingText
                 val key = buildString {
@@ -155,9 +153,9 @@ class NlpManager(context: Context) {
                     append(surrounding.textBefore).append('\u0000')
                     append(surrounding.textSelected).append('\u0000')
                     append(surrounding.textAfter).append('|')
-                    append(state.flags.isIncognitoMode)
+                    append(isPrivateSession)
                 }
-                return SuggestionRequest(content, state.flags.isIncognitoMode, key)
+                return SuggestionRequest(content, isPrivateSession, key)
             }
         }
     }

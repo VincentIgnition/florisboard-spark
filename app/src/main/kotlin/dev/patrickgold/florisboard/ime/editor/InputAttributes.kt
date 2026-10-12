@@ -88,6 +88,28 @@ value class InputAttributes private constructor(val raw: Int) {
     val flagTextNoSuggestions: Boolean
         get() = type == Type.TEXT && (raw and InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS != 0)
 
+    /**
+     * Why word suggestions are withheld for this field, or null if they are shown. Like SwiftKey, this ignores
+     * [flagTextNoSuggestions]: browsers set it on their address bar and on every web field marked
+     * autocomplete="off", which would hide suggestions in most of the places people type.
+     */
+    val suggestionsBlockedReason: String?
+        get() = when {
+            type != Type.TEXT -> "not a text field ($type)"
+            variation == Variation.PASSWORD ||
+                variation == Variation.VISIBLE_PASSWORD ||
+                variation == Variation.WEB_PASSWORD -> "password field"
+            else -> null
+        }
+
+    /**
+     * True if the field asked for no suggestions outside of a plain web text field, typically a browser address
+     * bar. Suggestions are still shown there, but nothing typed is learned and auto-correct only fires on space,
+     * so that domains like "ycombinator.com" are never rewritten at the dot.
+     */
+    val requestsNoSuggestions: Boolean
+        get() = flagTextNoSuggestions && variation != Variation.WEB_EDIT_TEXT
+
 
 
     companion object {

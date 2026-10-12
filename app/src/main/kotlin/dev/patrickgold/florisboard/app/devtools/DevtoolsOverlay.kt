@@ -123,6 +123,13 @@ private fun DevtoolsInputStateOverlay() {
     DevtoolsOverlayBox(title = "Input state overlay") {
         DevtoolsSubGroup(title = "EditorInfo") {
             DevtoolsText(text = "Type=${info.inputAttributes.type} Variation=${info.inputAttributes.variation} IsRich=${info.isRichInputEditor}")
+            DevtoolsText(text = "Package=${info.packageName} InputType=0x${info.inputAttributes.raw.toString(16)}")
+            DevtoolsText(
+                text = "Suggestions=" + (info.inputAttributes.suggestionsBlockedReason?.let { "blocked ($it)" } ?: "shown") +
+                    " NoSuggestionsFlag=${info.inputAttributes.flagTextNoSuggestions}" +
+                    " RestrictedField=${info.inputAttributes.requestsNoSuggestions}" +
+                    " Incognito=${imeState.flags.isIncognitoMode}"
+            )
             DevtoolsText(text = "InitialSelection: ${info.initialSelection}")
         }
         DevtoolsSubGroup(title = "EditorContent") {
