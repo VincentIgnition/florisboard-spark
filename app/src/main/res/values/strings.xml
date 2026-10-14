@@ -435,6 +435,10 @@
     <string name="settings__keyboard__title" comment="Title of Keyboard preferences screen">Keyboard</string>
     <string name="pref__keyboard__number_row__label" comment="Preference title">Number row</string>
     <string name="pref__keyboard__number_row__summary" comment="Preference summary">Show a number row above the character layout</string>
+    <string name="prefs__media__gif__title" comment="Preference group title">GIFs</string>
+    <string name="prefs__media__gif_giphy_api_key" comment="Preference title">GIPHY API key</string>
+    <string name="prefs__media__gif_giphy_api_key__summary_empty" comment="Preference summary">Needed for GIF search in the emoji panel. Create a free key at developers.giphy.com</string>
+    <string name="prefs__media__gif_giphy_api_key__summary_set" comment="Preference summary">Key saved. Free keys allow 100 searches per hour.</string>
     <string name="pref__correction__auto_correct__label" comment="Preference title">Auto-correct</string>
     <string name="pref__correction__auto_correct__summary" comment="Preference summary">Fix obvious typos when you press space or punctuation. Press backspace right after to undo.</string>
     <string name="pref__keyboard__arrow_row__label" comment="Preference title">Arrow key row</string>

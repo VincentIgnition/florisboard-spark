@@ -354,6 +354,9 @@ class FlorisImeService : LifecycleInputMethodService() {
         FlorisImeServiceReference = WeakReference(null)
     }
 
+    /** True once the current editor has delivered a selection update, see [onUpdateSelection]. */
+    private var hasSelectionUpdates = false
+
     override fun onStartInput(info: EditorInfo?, restarting: Boolean) {
         flogInfo { "info=${info?.debugSummarize()} restarting=$restarting" }
         super.onStartInput(info, restarting)
@@ -364,6 +367,7 @@ class FlorisImeService : LifecycleInputMethodService() {
         flogInfo { "info=${info?.debugSummarize()} restarting=$restarting" }
         super.onStartInputView(info, restarting)
         if (info == null) return
+        hasSelectionUpdates = false
         currentInputConnection?.requestCursorUpdates(ImeEditor.CURSOR_UPDATES)
         val ic = WeakReference(currentInputConnection)
         val editorInfo = FlorisEditorInfo.wrap(info)
@@ -383,10 +387,42 @@ class FlorisImeService : LifecycleInputMethodService() {
         if (cursorAnchorInfo == null) {
             return
         }
+        // Once the editor delivers selection updates they are authoritative: anchor info can arrive late and would
+        // otherwise rewind the cursor to an older position, corrupting the next edit
+        if (hasSelectionUpdates) {
+            return
+        }
+        if (cursorAnchorInfo.selectionStart < 0 || cursorAnchorInfo.selectionEnd < 0) {
+            return
+        }
         val newSelection = K3TextRange(
             start = cursorAnchorInfo.selectionStart,
             end = cursorAnchorInfo.selectionEnd,
         )
+        flogInfo { "new=$newSelection" }
+        imeController.updateStateBlocking {
+            handleUpdateSelection(newSelection)
+        }
+    }
+
+    // Cursor anchor info alone is not reliable: Chromium stops sending it whenever it loses the coordinates of the
+    // focused element, which happens on page re-renders. The keyboard's idea of the cursor then goes stale and its
+    // edits miss the field. Selection updates are delivered for every change, so they take over as soon as the first
+    // one arrives; updates matching the keyboard's own edits are filtered out by handleUpdateSelection.
+    override fun onUpdateSelection(
+        oldSelStart: Int,
+        oldSelEnd: Int,
+        newSelStart: Int,
+        newSelEnd: Int,
+        candidatesStart: Int,
+        candidatesEnd: Int,
+    ) {
+        super.onUpdateSelection(oldSelStart, oldSelEnd, newSelStart, newSelEnd, candidatesStart, candidatesEnd)
+        if (newSelStart < 0 || newSelEnd < 0) {
+            return
+        }
+        hasSelectionUpdates = true
+        val newSelection = K3TextRange(start = newSelStart, end = newSelEnd)
         flogInfo { "new=$newSelection" }
         imeController.updateStateBlocking {
             handleUpdateSelection(newSelection)

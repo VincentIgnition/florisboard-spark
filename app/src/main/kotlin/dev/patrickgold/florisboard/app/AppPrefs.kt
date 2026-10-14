@@ -283,6 +283,14 @@ abstract class FlorisPreferenceModel : PreferenceModel() {
         )
     }
 
+    val gif = Gif()
+    inner class Gif {
+        val giphyApiKey = string(
+            key = "gif__giphy_api_key",
+            default = "",
+        )
+    }
+
     val gestures = Gestures()
     inner class Gestures {
         val swipeUp = enum(

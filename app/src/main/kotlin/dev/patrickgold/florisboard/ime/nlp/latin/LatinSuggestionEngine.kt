@@ -197,6 +197,50 @@ class LatinSuggestionEngine(dictionary: Map<String, Int>) {
         /** The chosen auto-correction must beat the next best correction by at least this much. */
         private const val AUTO_CORRECT_MIN_MARGIN = 0.03
 
+        /** Inputs shorter than this are never split into two words. */
+        private const val MIN_SPLIT_INPUT_LENGTH = 4
+        /** Score penalty for reading the input as two words with a missing space. */
+        private const val SPLIT_PENALTY = 0.1
+        /**
+         * Extra penalty when a letter next to the space bar is read as a missed space. Kept high so that keeping
+         * every typed letter wins whenever it also gives two words ("thecat" is "the cat", not "the at").
+         */
+        private const val SPLIT_SPACE_MISS_PENALTY = 0.3
+        /** Edit distance assigned to splits, so auto-correct treats them like a one-key slip. */
+        private const val SPLIT_DISTANCE = 1.0
+        /** Each part of a split must be at least this common, so rare or junk words never form a split. */
+        private const val SPLIT_MIN_PART_SCORE = 0.25
+
+        /** Bottom row letters that a thumb aiming for the space bar may hit instead. */
+        private const val SPACE_BAR_NEIGHBORS = "vbnm"
+
+        /**
+         * One and two letter words allowed as part of a split. The dictionary has hundreds of two letter entries
+         * that are abbreviations or noise, so these are listed explicitly.
+         */
+        private val SPLIT_SHORT_WORDS = hashSetOf(
+            "a", "i", "of", "to", "in", "is", "it", "on", "be", "as", "at", "he", "by", "or", "an", "my", "we", "so",
+            "me", "if", "up", "no", "do", "go", "us", "am", "oh", "hi", "ok",
+        )
+
+        /**
+         * Two words glued together that the web-scraped dictionary lists as words. Removing them lets the split
+         * correction fix them. Glued forms that are real words ("todo", "tome", "whatnot") are not listed.
+         */
+        private val GLUED_PHRASES = hashSetOf(
+            "ofthe", "inthe", "thankyou", "noone", "upto", "howto", "goto", "asif", "itis", "ofa", "ifa", "ina", "ona",
+            "toa", "isa", "ita", "ato", "aan", "ais", "ait", "aso", "doa", "upa", "cana", "mya", "anda", "soa", "noa",
+            "wea", "beit", "forme", "tous", "atleast", "aswell", "infact", "eachother", "alittle", "incase", "inorder",
+            "ontop", "everytime", "iam", "idont", "ofcourse", "inbetween",
+        )
+
+        /** Common words missing from the bundled dictionary, which would otherwise be split or corrected. */
+        private val SUPPLEMENTAL_WORDS = mapOf(
+            "subreddit" to 170, "subreddits" to 165, "upvote" to 170, "upvoted" to 165, "upvotes" to 165,
+            "downvote" to 170, "downvoted" to 165, "downvotes" to 165, "modding" to 165, "modder" to 160,
+            "modders" to 160, "codebase" to 165, "frontend" to 165,
+        )
+
         private const val TRANSPOSE_COST = 0.75
         private const val ADJACENT_SUBSTITUTE_COST = 0.5
         private const val APOSTROPHE_EDIT_COST = 0.1
@@ -304,6 +348,8 @@ class LatinSuggestionEngine(dictionary: Map<String, Int>) {
     }
 
     private val baseFreq = HashMap<String, Int>(dictionary.size * 2)
+    // Contractions by their apostrophe-less form, e.g. "dont" to "don't", so split parts can be written properly
+    private val contractionsByBareForm = HashMap<String, String>()
     private val sortedWords: Array<String>
     private val wordsByLength: Array<ArrayList<String>> = Array(MAX_WORD_LENGTH + 1) { ArrayList() }
     private val wordsByFirstChar = HashMap<Char, ArrayList<String>>()
@@ -332,10 +378,17 @@ class LatinSuggestionEngine(dictionary: Map<String, Int>) {
             val bare = word.replace("'", "")
             if (bare !in CONTRACTION_LOOKALIKES) {
                 baseFreq.remove(bare)
+                contractionsByBareForm[bare] = word
             }
         }
         for (word in KNOWN_MISSPELLINGS) {
             baseFreq.remove(word)
+        }
+        for (word in GLUED_PHRASES) {
+            baseFreq.remove(word)
+        }
+        for ((word, freq) in SUPPLEMENTAL_WORDS) {
+            baseFreq[word] = max(baseFreq[word] ?: 0, freq)
         }
         sortedWords = baseFreq.keys.toTypedArray().also { it.sort() }
         for (word in sortedWords) {
@@ -557,11 +610,24 @@ class LatinSuggestionEngine(dictionary: Map<String, Int>) {
             }
         }
 
+        // Two words typed without a space between them
+        val splits = HashMap<String, LatinSplit>()
+        if (query.length >= MIN_SPLIT_INPUT_LENGTH && query.none { it == '\'' } && !isKnownWord(query)) {
+            for (split in findSplits(query, previous, allowPossiblyOffensive)) {
+                val existing = scores[split.key]
+                if (existing == null || split.score > existing) {
+                    scores[split.key] = split.score
+                    corrections[split.key] = SPLIT_DISTANCE
+                    splits[split.key] = split
+                }
+            }
+        }
+
         val ranked = scores.entries
             .sortedWith(compareByDescending<Map.Entry<String, Double>> { it.value }.thenBy { it.key })
             .toMutableList()
 
-        val autoCorrectWord = pickAutoCorrection(input, query, ranked, corrections)
+        val autoCorrectWord = pickAutoCorrection(input, query, previous, ranked, corrections, splits.keys)
         if (autoCorrectWord != null) {
             val entry = ranked.first { it.key == autoCorrectWord }
             ranked.remove(entry)
@@ -569,23 +635,83 @@ class LatinSuggestionEngine(dictionary: Map<String, Int>) {
         }
 
         val sentenceStart = previous == LatinTextAnalysis.SENTENCE_START
+        fun display(key: String): String {
+            val split = splits[key] ?: return applyCase(key, input, sentenceStart)
+            return applyCase(split.left, input.substring(0, split.leftInputEnd), sentenceStart) + " " +
+                applyCase(split.right, input.substring(split.rightInputStart), false)
+        }
         val words = ranked
             .asSequence()
             .take(maxCount)
-            .map { applyCase(it.key, input, sentenceStart) }
+            .map { display(it.key) }
             .distinct()
             .toList()
         return LatinSuggestionResult(
             words = words,
-            autoCorrection = autoCorrectWord?.let { applyCase(it, input, sentenceStart) },
+            autoCorrection = autoCorrectWord?.let { display(it) },
         )
+    }
+
+    /**
+     * A reading of the input as two words.
+     *
+     * @property leftInputEnd Where the left word ends in the input.
+     * @property rightInputStart Where the right word starts in the input, one past [leftInputEnd] when a letter
+     *  next to the space bar was read as the missed space.
+     */
+    private class LatinSplit(
+        val left: String,
+        val right: String,
+        val leftInputEnd: Int,
+        val rightInputStart: Int,
+        val score: Double,
+    ) {
+        val key: String
+            get() = "$left $right"
+    }
+
+    /**
+     * Returns the word a split part stands for and its score, or null if the part is not a plausible word. Parts
+     * typed without their apostrophe resolve to the contraction ("dont" to "don't").
+     */
+    private fun resolveSplitPart(part: String, allowPossiblyOffensive: Boolean): Pair<String, Double>? {
+        val word = contractionsByBareForm[part]?.takeIf { isSuggestable(it) } ?: part
+        if (word.length <= 2 && word !in SPLIT_SHORT_WORDS) return null
+        if (!isSuggestable(word)) return null
+        if (!allowPossiblyOffensive && isOffensive(word)) return null
+        val score = unigramScore(word)
+        return if (word.length > 2 && score < SPLIT_MIN_PART_SCORE) null else word to score
+    }
+
+    private fun findSplits(query: String, previous: String?, allowPossiblyOffensive: Boolean): List<LatinSplit> {
+        val result = ArrayList<LatinSplit>()
+        fun tryAdd(leftEnd: Int, rightStart: Int, penalty: Double) {
+            if (leftEnd <= 0 || rightStart >= query.length) return
+            val (left, leftScore) = resolveSplitPart(query.substring(0, leftEnd), allowPossiblyOffensive) ?: return
+            val (right, rightScore) = resolveSplitPart(query.substring(rightStart), allowPossiblyOffensive) ?: return
+            // The weaker word decides how plausible the split is, so one common word cannot carry a rare one
+            val score = min(leftScore, rightScore) +
+                BIGRAM_WEIGHT * (bigramScore(previous, left) + bigramScore(left, right)) / 2 - penalty
+            result.add(LatinSplit(left, right, leftEnd, rightStart, score))
+        }
+        for (i in 1 until query.length) {
+            tryAdd(i, i, SPLIT_PENALTY)
+        }
+        for (i in 1 until query.length - 1) {
+            if (query[i] in SPACE_BAR_NEIGHBORS) {
+                tryAdd(i, i + 1, SPLIT_PENALTY + SPLIT_SPACE_MISS_PENALTY)
+            }
+        }
+        return result
     }
 
     private fun pickAutoCorrection(
         input: String,
         query: String,
+        previous: String?,
         ranked: List<Map.Entry<String, Double>>,
         corrections: Map<String, Double>,
+        splitKeys: Set<String>,
     ): String? {
         if (query.length < 2 || ranked.isEmpty()) return null
         if (query.any { !LatinTextAnalysis.isWordChar(it) }) return null
@@ -598,6 +724,11 @@ class LatinSuggestionEngine(dictionary: Map<String, Int>) {
         // Only small slips get fixed silently, anything bigger is likely a name, slang or gibberish
         val maxAutoDistance = if (query.length <= 5) 1.0 else 1.5
         if (corrections.getValue(best.key) > maxAutoDistance) return null
+        // A capitalized word mid-sentence is most likely a name like "Skyrim", never break it in two
+        val isCapitalized = input.first().isUpperCase() && input.any { it.isLowerCase() }
+        if (best.key in splitKeys && isCapitalized && previous != LatinTextAnalysis.SENTENCE_START) {
+            return null
+        }
         val topScore = ranked.first().value
         if (best.value < topScore - AUTO_CORRECT_MAX_RANK_GAP) return null
         val runnerUp = correctionEntries.getOrNull(1)

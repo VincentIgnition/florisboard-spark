@@ -39,6 +39,14 @@ class InputAttributesSuggestionsTest : FunSpec({
         attributes.requestsNoSuggestions shouldBe false
     }
 
+    test("multi-line native field asking for no suggestions still learns") {
+        val raw = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS or
+            InputType.TYPE_TEXT_FLAG_MULTI_LINE
+        val attributes = InputAttributes.wrap(raw)
+        attributes.suggestionsBlockedReason.shouldBeNull()
+        attributes.requestsNoSuggestions shouldBe false
+    }
+
     test("ordinary fields get suggestions") {
         val attributes = InputAttributes.wrap(InputType.TYPE_CLASS_TEXT)
         attributes.suggestionsBlockedReason.shouldBeNull()

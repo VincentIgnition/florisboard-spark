@@ -103,12 +103,14 @@ value class InputAttributes private constructor(val raw: Int) {
         }
 
     /**
-     * True if the field asked for no suggestions outside of a plain web text field, typically a browser address
-     * bar. Suggestions are still shown there, but nothing typed is learned and auto-correct only fires on space,
-     * so that domains like "ycombinator.com" are never rewritten at the dot.
+     * True for single-line native fields that ask for no suggestions, typically a browser address bar. Suggestions
+     * are still shown there, but nothing typed is learned and auto-correct only fires on space, so that domains like
+     * "ycombinator.com" are never rewritten at the dot. Multi-line fields such as comment boxes are excluded even if
+     * they set the flag, so typing there is still learned.
      */
     val requestsNoSuggestions: Boolean
-        get() = flagTextNoSuggestions && variation != Variation.WEB_EDIT_TEXT
+        get() = flagTextNoSuggestions && variation != Variation.WEB_EDIT_TEXT &&
+            !flagTextMultiLine && !flagTextImeMultiLine
 
 
 

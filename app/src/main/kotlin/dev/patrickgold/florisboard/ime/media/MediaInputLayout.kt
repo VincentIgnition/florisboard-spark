@@ -40,6 +40,7 @@ import dev.patrickgold.florisboard.ime.keyboard3.ui.ImeKeyButton
 import dev.patrickgold.florisboard.ime.media.emoji.EmojiData
 import dev.patrickgold.florisboard.ime.media.emoji.EmojiPaletteView
 import dev.patrickgold.florisboard.ime.media.emoji.EmojiSearchLayout
+import dev.patrickgold.florisboard.ime.media.gif.GifSearchLayout
 import dev.patrickgold.florisboard.ime.theme.FlorisImeUi
 import dev.patrickgold.jetpref.datastore.model.collectAsState
 import org.florisboard.lib.snygg.ui.SnyggButton
@@ -62,7 +63,10 @@ fun MediaInputLayout(
     }
 
     var isEmojiSearch by remember { mutableStateOf(false) }
-    if (isEmojiSearch) {
+    var isGifSearch by remember { mutableStateOf(false) }
+    if (isGifSearch) {
+        GifSearchLayout(onBack = { isGifSearch = false })
+    } else if (isEmojiSearch) {
         EmojiSearchLayout()
     } else {
         SnyggColumn(
@@ -103,6 +107,16 @@ fun MediaInputLayout(
                             text = "Search",
                         )
                     }
+                }
+                SnyggButton(
+                    modifier = Modifier
+                        .minimumInteractiveComponentSize()
+                        .align(Alignment.CenterVertically),
+                    onClick = { isGifSearch = true },
+                ) {
+                    SnyggText(
+                        text = "GIF",
+                    )
                 }
                 Spacer(modifier = Modifier.weight(1f))
                 ImeKeyButton(

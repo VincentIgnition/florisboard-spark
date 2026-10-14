@@ -18,10 +18,12 @@ package dev.patrickgold.florisboard.ime.keyboard3
 
 import android.content.ClipDescription
 import android.content.ContentUris
+import android.net.Uri
 import android.os.SystemClock
 import android.view.KeyCharacterMap
 import android.view.KeyEvent
 import android.view.inputmethod.InputConnection
+import androidx.core.view.inputmethod.EditorInfoCompat
 import androidx.core.view.inputmethod.InputConnectionCompat
 import androidx.core.view.inputmethod.InputContentInfoCompat
 import dev.patrickgold.florisboard.FlorisApplication
@@ -131,6 +133,25 @@ open class ImeEditor(
             uri,
             ClipDescription("clipboard media file", mimeTypes.toTypedArray()),
             null,
+        )
+        ic.finishComposingText()
+        val flags = InputConnectionCompat.INPUT_CONTENT_GRANT_READ_URI_PERMISSION
+        return InputConnectionCompat.commitContent(ic, info.base, inputContentInfo, flags, null)
+    }
+
+    /**
+     * Sends an image such as a GIF to the editor, the way messaging apps receive stickers and GIFs.
+     *
+     * @return False if the editor does not accept [mimeType] or refused the content.
+     */
+    fun commitImage(uri: Uri, mimeType: String, description: String, linkUri: Uri?): Boolean {
+        val ic = ic.get() ?: return false
+        val acceptedTypes = EditorInfoCompat.getContentMimeTypes(info.base)
+        if (acceptedTypes.none { ClipDescription.compareMimeTypes(mimeType, it) }) return false
+        val inputContentInfo = InputContentInfoCompat(
+            uri,
+            ClipDescription(description, arrayOf(mimeType)),
+            linkUri,
         )
         ic.finishComposingText()
         val flags = InputConnectionCompat.INPUT_CONTENT_GRANT_READ_URI_PERMISSION

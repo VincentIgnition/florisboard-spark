@@ -146,6 +146,54 @@ class LatinSuggestionEngineTest : FunSpec({
         engine.suggestDetailed("teh", null, 5, false).autoCorrection.shouldBeNull()
     }
 
+    test("splits two words typed without a space") {
+        val engine = newEngine()
+        fun auto(input: String, previous: String? = null) =
+            engine.suggestDetailed(input, previous, 5, false).autoCorrection
+        auto("thecat") shouldBe "the cat"
+        auto("goingto") shouldBe "going to"
+        auto("iwant") shouldBe "I want"
+        auto("becausethe") shouldBe "because the"
+        auto("THECAT") shouldBe "THE CAT"
+        auto("Thecat", previous = LatinTextAnalysis.SENTENCE_START) shouldBe "The cat"
+    }
+
+    test("splits glued phrases the dictionary used to list as words") {
+        val engine = newEngine()
+        fun auto(input: String) = engine.suggestDetailed(input, null, 5, false).autoCorrection
+        auto("ofthe") shouldBe "of the"
+        auto("inthe") shouldBe "in the"
+        auto("thankyou") shouldBe "thank you"
+        auto("noone") shouldBe "no one"
+        auto("atleast") shouldBe "at least"
+    }
+
+    test("restores apostrophes in split contractions") {
+        val engine = newEngine()
+        fun auto(input: String) = engine.suggestDetailed(input, null, 5, false).autoCorrection
+        auto("dontknow") shouldBe "don't know"
+        auto("cantwait") shouldBe "can't wait"
+        auto("imgoing") shouldBe "I'm going"
+    }
+
+    test("reads a bottom row key next to the space bar as a missed space") {
+        val engine = newEngine()
+        fun auto(input: String) = engine.suggestDetailed(input, null, 5, false).autoCorrection
+        auto("hellobworld") shouldBe "hello world"
+        auto("thatnis") shouldBe "that is"
+    }
+
+    test("never splits real words, supplemented words or capitalized names") {
+        val engine = newEngine()
+        fun result(input: String) = engine.suggestDetailed(input, null, 5, false)
+        for (word in listOf("carpet", "therapist", "today", "notebook", "into", "nowhere", "something", "become",
+            "subreddit", "upvote", "modding", "codebase", "frontend", "skyrim")) {
+            result(word).autoCorrection.shouldBeNull()
+            result(word).words.none { ' ' in it } shouldBe true
+        }
+        result("Thecat").autoCorrection.shouldBeNull()
+    }
+
     test("never suggests stray single letters") {
         val engine = newEngine()
         engine.top("h") shouldNotContain "h"

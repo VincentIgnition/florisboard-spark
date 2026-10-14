@@ -63,23 +63,14 @@ class LatinLanguageProvider(context: Context) : SpellingProvider, SuggestionProv
     private val wordDataSerializer = MapSerializer(String.serializer(), Int.serializer())
     private val ioScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
-    // Everything below is guarded by engineLock, except the @Volatile fields
+    // Guarded by engineLock
     private val engineLock = Mutex()
     private var engine: LatinSuggestionEngine? = null
     private var wordData: Map<String, Int> = emptyMap()
     private var saveJob: Job? = null
-    private var lastLearnedKey: String? = null
 
-    // The word being typed as of the previous suggest() call and the absolute cursor position at its end. A word is
-    // only learned when the user actually typed it here, not when the cursor is merely moved next to old text.
-    @Volatile
-    private var pendingWord: String? = null
-    @Volatile
-    private var pendingWordEnd: Int = -1
-
-    // The text of the most recently tapped candidate, so it is learned even though it was never typed out fully.
-    @Volatile
-    private var acceptedWord: String? = null
+    // Guarded by synchronized(learningTracker), kept off engineLock so candidate taps never wait on a suggestion run
+    private val learningTracker = LatinLearningTracker()
 
     override val providerId = ProviderId
 
@@ -174,34 +165,36 @@ class LatinLanguageProvider(context: Context) : SpellingProvider, SuggestionProv
     ): List<SuggestionCandidate> {
         val selection = content.selection
         if (selection.isNotCollapsed()) {
-            pendingWord = null
+            synchronized(learningTracker) { learningTracker.reset() }
             return emptyList()
         }
         val textBefore = content.surroundingText.textBefore
         val textAfter = content.surroundingText.textAfter
         if (textAfter.isNotEmpty() && LatinTextAnalysis.isWordChar(textAfter[0])) {
             // Cursor is in the middle of a word, replacing only its left half would mangle it
-            pendingWord = null
+            synchronized(learningTracker) { learningTracker.reset() }
             return emptyList()
         }
         val hasMoreBefore = selection.min > textBefore.length
         val currentWord = LatinTextAnalysis.currentWord(textBefore)
+        val learnable = synchronized(learningTracker) {
+            learningTracker.observe(textBefore, selection.min, hasMoreBefore, currentWord)
+        }
 
         val result = engineLock.withLock {
             val currentEngine = ensureEngineLocked()
-            if (currentWord.isEmpty()) {
-                if (!isPrivateSession) {
-                    learnLocked(currentEngine, textBefore, selection.min, hasMoreBefore)
+            if (learnable != null && !isPrivateSession) {
+                if (currentEngine.learn(learnable.previous, learnable.word)) {
+                    scheduleSaveLocked()
                 }
-                pendingWord = null
+            }
+            if (currentWord.isEmpty()) {
                 val previous = LatinTextAnalysis.previousWord(textBefore, hasMoreBefore)
                 LatinSuggestionResult(
                     words = currentEngine.predictNext(previous, maxCandidateCount, allowPossiblyOffensive),
                     autoCorrection = null,
                 )
             } else {
-                pendingWord = currentWord
-                pendingWordEnd = selection.min
                 val textBeforeWord = textBefore.substring(0, textBefore.length - currentWord.length)
                 val previous = LatinTextAnalysis.previousWord(textBeforeWord, hasMoreBefore)
                 currentEngine.suggestDetailed(currentWord, previous, maxCandidateCount, allowPossiblyOffensive)
@@ -228,40 +221,14 @@ class LatinLanguageProvider(context: Context) : SpellingProvider, SuggestionProv
         }
     }
 
-    private fun learnLocked(
-        currentEngine: LatinSuggestionEngine,
-        textBefore: String,
-        cursor: Int,
-        hasMoreBefore: Boolean,
-    ) {
-        val completed = LatinTextAnalysis.lastCompletedWord(textBefore, hasMoreBefore) ?: return
-        val wordEnd = cursor - completed.charsAfter
-        val typed = pendingWord
-        val accepted = acceptedWord
-        // Fast typing can skip intermediate editor states, so the last seen partial word may be a prefix of the
-        // finished one, as long as it was being typed at that same spot
-        val wasTyped = typed != null && completed.word.startsWith(typed) &&
-            pendingWordEnd + (completed.word.length - typed.length) == wordEnd
-        val wasAccepted = accepted != null &&
-            LatinSuggestionEngine.normalize(accepted) == LatinSuggestionEngine.normalize(completed.word)
-        if (!wasTyped && !wasAccepted) return
-        val key = "$wordEnd:${completed.word}"
-        if (key == lastLearnedKey) return
-        lastLearnedKey = key
-        acceptedWord = null
-        if (currentEngine.learn(completed.previous, completed.word)) {
-            scheduleSaveLocked()
-        }
-    }
-
     override suspend fun notifySuggestionAccepted(subtype: Subtype, candidate: SuggestionCandidate) {
-        acceptedWord = candidate.text.toString()
+        synchronized(learningTracker) { learningTracker.onCandidateAccepted(candidate.text.toString()) }
     }
 
     override suspend fun notifySuggestionReverted(subtype: Subtype, candidate: SuggestionCandidate) {
         if (candidate !is AutoCorrectionCandidate) return
         // The user undid the correction, so what they typed is a word they want to keep
-        acceptedWord = null
+        synchronized(learningTracker) { learningTracker.onCandidateReverted() }
         engineLock.withLock {
             if (ensureEngineLocked().acceptWord(candidate.originalWord)) {
                 scheduleSaveLocked()

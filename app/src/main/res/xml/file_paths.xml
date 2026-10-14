@@ -3,4 +3,7 @@
     <cache-path
         name="backup"
         path="backup-and-restore/"/>
+    <cache-path
+        name="gifs"
+        path="gifs/"/>
 </paths>

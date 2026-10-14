@@ -40,6 +40,7 @@ import dev.patrickgold.jetpref.datastore.ui.ListPreference
 import dev.patrickgold.jetpref.datastore.ui.Preference
 import dev.patrickgold.jetpref.datastore.ui.PreferenceGroup
 import dev.patrickgold.jetpref.datastore.ui.SwitchPreference
+import dev.patrickgold.jetpref.datastore.ui.TextFieldPreference
 import dev.patrickgold.jetpref.material.ui.JetPrefAlertDialog
 import kotlinx.coroutines.launch
 import org.florisboard.lib.compose.pluralsRes
@@ -116,6 +117,17 @@ fun MediaScreen() = FlorisScreen {
                 enabledIf = { prefs.emoji.historyEnabled.isTrue() },
             )
 
+        }
+
+        PreferenceGroup(title = stringRes(R.string.prefs__media__gif__title)) {
+            val keySavedSummary = stringRes(R.string.prefs__media__gif_giphy_api_key__summary_set)
+            TextFieldPreference(
+                prefs.gif.giphyApiKey,
+                title = stringRes(R.string.prefs__media__gif_giphy_api_key),
+                summaryIfEmpty = stringRes(R.string.prefs__media__gif_giphy_api_key__summary_empty),
+                summaryIfBlank = stringRes(R.string.prefs__media__gif_giphy_api_key__summary_empty),
+                summary = { keySavedSummary },
+            )
         }
 
         PreferenceGroup(title = stringRes(R.string.prefs__media__emoji_suggestion__title)) {
