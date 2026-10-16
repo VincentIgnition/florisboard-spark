@@ -19,6 +19,7 @@ package dev.patrickgold.florisboard.ime.keyboard3
 
 import android.icu.text.BreakIterator
 import android.text.TextUtils
+import android.os.SystemClock
 import android.view.KeyEvent
 import android.view.inputmethod.InputConnection
 import androidx.compose.runtime.staticCompositionLocalOf
@@ -52,6 +53,11 @@ import dev.patrickgold.florisboard.ime.nlp.latin.LatinTextAnalysis
 import dev.patrickgold.florisboard.ime.text.key.KeyVariation
 import dev.patrickgold.florisboard.lib.FlorisLocale
 import dev.patrickgold.florisboard.lib.devtools.flogDebug
+import dev.patrickgold.florisboard.ime.nlp.latin.LatinKeyLayout
+import dev.patrickgold.florisboard.ime.nlp.latin.LatinKeyTouch
+import dev.patrickgold.florisboard.ime.nlp.latin.LatinTouchTrace
+import dev.patrickgold.florisboard.lib.devtools.flogError
+import dev.patrickgold.florisboard.lib.devtools.flogWarning
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -95,6 +101,38 @@ class ImeController(
 
     /** The most recent auto-correction, undoable by a backspace pressed right after it. */
     private var lastAutoCorrection: AppliedAutoCorrection? = null
+
+    /**
+     * The most recent auto-correction ended by a space, kept while the next word is typed so an accidental space
+     * right after it can still be undone using what the user actually typed.
+     */
+    private var recentSpaceAutoCorrection: AppliedAutoCorrection? = null
+
+    /**
+     * Where the word restored by the latest undone auto-correction ends, so looking back from the next word never
+     * changes it again.
+     */
+    private var revertedWordEnd: Int = -1
+    /** The word restored by the latest undone auto-correction, see [revertedWordEnd]. */
+    private var revertedWord: String? = null
+
+    /** A key tap waiting for the text it produces, see [notePendingTap]. */
+    private class PendingTap(val char: Char, val touch: LatinKeyTouch, val layout: LatinKeyLayout)
+    private var pendingTap: PendingTap? = null
+
+    // Where each letter of the word being typed was tapped, null for letters not typed by a tap
+    private val wordTouches = ArrayList<LatinKeyTouch?>()
+    private var wordTouchLayout: LatinKeyLayout? = null
+    // Cursor position right after the last letter recorded in wordTouches, -1 if none
+    private var wordTouchEnd = -1
+
+    /**
+     * Called by the touch handling right before a tapped letter key is typed, with where the finger landed. Auto-
+     * correct uses it to tell a sloppy tap on the edge of a key from a deliberate one in its middle.
+     */
+    fun notePendingTap(char: Char, touch: LatinKeyTouch, layout: LatinKeyLayout) {
+        pendingTap = PendingTap(char, touch, layout)
+    }
 
     private data class AppliedAutoCorrection(
         val candidate: AutoCorrectionCandidate,
@@ -302,24 +340,140 @@ class ImeController(
             resetContent(initialSelection, initialSurrounding)
             expectedContentQueue.clear()
             lastAutoCorrection = null
+            recentSpaceAutoCorrection = null
+            revertedWordEnd = -1
+            revertedWord = null
+            pendingTap = null
+            wordTouches.clear()
+            wordTouchEnd = -1
         }
 
+        /** For updates that only report the new cursor, like cursor anchor info, which are never treated as belated. */
         fun handleUpdateSelection(newSelection: K3TextRange) {
+            handleUpdateSelection(state.content.selection, newSelection)
+        }
+
+        fun handleUpdateSelection(oldSelection: K3TextRange, newSelection: K3TextRange) {
             val content = expectedContentQueue.popUntilOrNull { it.selection == newSelection }
             if (content != null) {
                 flogDebug { "DEDUPLICATED!!1" }
                 return
             }
-            resetContent(newSelection, state.editor.getSurroundingText(50, 10))
+            if (isBelatedUpdate(oldSelection, newSelection)) {
+                flogDebug { "Belated update, skipped" }
+                return
+            }
+            // A failure here runs outside any key press and would otherwise take the whole keyboard down
+            try {
+                resyncFromEditor(newSelection)
+            } catch (e: Exception) {
+                flogError { "Selection update failed: ${e.stackTraceToString()}" }
+            }
+        }
+
+        /**
+         * True if a selection update is an intermediate step on the way to the cursor position the keyboard already
+         * expects, which happens when the editor falls behind delivering updates for fast typing. Reading the text
+         * again for those would cost a round trip to the editor each time for nothing. Same rule as AOSP LatinIME's
+         * RichInputConnection.isBelatedExpectedUpdate: the cursor moved from its old position toward the expected
+         * one without passing it. An update that starts where the keyboard expects the cursor and moves away is
+         * never belated, that is the editor or the user moving it.
+         */
+        private fun isBelatedUpdate(oldSelection: K3TextRange, newSelection: K3TextRange): Boolean {
+            val expected = state.content.selection
+            if (expected == oldSelection && newSelection != oldSelection) return false
+            if (newSelection.start != newSelection.end) return false
+            return (newSelection.start - oldSelection.start).toLong() * (expected.start - newSelection.start) >= 0 &&
+                (newSelection.end - oldSelection.end).toLong() * (expected.end - newSelection.end) >= 0
+        }
+
+        /**
+         * Reads the cursor and the text around it from the editor and replaces the keyboard's copy with it.
+         *
+         * @param fallbackSelection Used if the editor cannot report cursor and text in one call.
+         */
+        private fun resyncFromEditor(fallbackSelection: K3TextRange?) {
+            // The update can describe an older state than the editor has by now, so cursor and text are read
+            // together. Mixing a stale cursor with newer text makes later edits land in the wrong place.
+            val startTime = SystemClock.uptimeMillis()
+            val snapshot = state.editor.getSurroundingSnapshot(50, 10)
+            if (snapshot != null) {
+                resetContent(snapshot.first, snapshot.second)
+            } else if (fallbackSelection != null) {
+                resetContent(fallbackSelection, state.editor.getSurroundingText(50, 10))
+            } else {
+                resetContent()
+            }
+            val elapsed = SystemClock.uptimeMillis() - startTime
+            if (elapsed >= SLOW_EDITOR_MS) {
+                // Shows up in the debug log, a slow editor blocks the keyboard while it waits
+                flogError { "Editor took ${elapsed}ms to report its text" }
+            }
             expectedContentQueue.push(state.content)
         }
 
+        /** After an unexpected error, gets back in sync with the editor so the next key lands in the right place. */
+        private fun recoverFromError(what: String, e: Exception) {
+            flogError { "$what failed: ${e.stackTraceToString()}" }
+            try {
+                resyncFromEditor(null)
+            } catch (e2: Exception) {
+                flogError { "Recovering from the error failed: ${e2.stackTraceToString()}" }
+            }
+        }
+
         override fun emitText(value: K3String) {
-            val applied = applyAutoCorrectionBefore(value.toText())
-            super.emitText(value)
+            val text = value.toText()
+            val tap = pendingTap
+            pendingTap = null
+            val cursorBefore = state.content.selection.min
+            // Auto-correct must never break typing, on any failure the key is simply typed as is
+            val applied = try {
+                applyAutoCorrectionBefore(text)
+            } catch (e: Exception) {
+                flogError { "Auto-correct failed: ${e.stackTraceToString()}" }
+                null
+            }
+            try {
+                super.emitText(value)
+            } catch (e: Exception) {
+                recoverFromError("Typing", e)
+                lastAutoCorrection = null
+                recentSpaceAutoCorrection = null
+                return
+            }
             expectedContentQueue.push(state.content)
             reevaluateInputShiftState()
+            trackWordTouch(text, tap, cursorBefore)
             lastAutoCorrection = applied?.copy(cursorAfter = state.content.selection.min)
+            if (applied != null && text == " ") {
+                recentSpaceAutoCorrection = lastAutoCorrection
+            } else if (text.length == 1 && text[0] in AUTO_CORRECT_SEPARATORS) {
+                recentSpaceAutoCorrection = null
+            }
+        }
+
+        /** Keeps [wordTouches] in step with the word being typed. */
+        private fun trackWordTouch(text: String, tap: PendingTap?, cursorBefore: Int) {
+            if (text.length == 1 && LatinTextAnalysis.isWordChar(text[0])) {
+                // A letter typed anywhere but right after the recorded ones starts a new word
+                if (cursorBefore != wordTouchEnd) wordTouches.clear()
+                val touch = tap?.takeIf { it.char.lowercaseChar() == text[0].lowercaseChar() }
+                wordTouches.add(touch?.touch)
+                if (touch != null) wordTouchLayout = touch.layout
+                wordTouchEnd = state.content.selection.min
+            } else {
+                wordTouches.clear()
+                wordTouchEnd = -1
+            }
+        }
+
+        /** The touch points of [currentWord] if every one of its letters was recorded, else null. */
+        private fun touchTraceFor(currentWord: String, cursor: Int): LatinTouchTrace? {
+            val layout = wordTouchLayout ?: return null
+            if (cursor != wordTouchEnd || wordTouches.size != currentWord.length) return null
+            if (wordTouches.all { it == null }) return null
+            return LatinTouchTrace(layout, wordTouches.toList())
         }
 
         /**
@@ -328,42 +482,120 @@ class ImeController(
          */
         private fun applyAutoCorrectionBefore(separator: String): AppliedAutoCorrection? {
             if (separator.length != 1 || separator[0] !in AUTO_CORRECT_SEPARATORS) return null
-            if (!prefs.correction.autoCorrect.get() || !prefs.suggestion.enabled.get()) return null
+            // Why a word was left alone ends up in the debug log, the typed text itself never does
+            fun skip(reason: String): AppliedAutoCorrection? {
+                flogWarning { "Auto-correct skipped: $reason" }
+                return null
+            }
+            if (!prefs.correction.autoCorrect.get()) return skip("auto-correct is off in settings")
+            if (!prefs.suggestion.enabled.get()) return skip("suggestions are off in settings")
             val info = state.editor.info
             val attributes = info.inputAttributes
-            if (attributes.suggestionsBlockedReason != null) return null
+            attributes.suggestionsBlockedReason?.let { return skip(it) }
             // In fields like browser address bars only a space confirms a correction, so that a "." inside a
             // domain name never rewrites the word before it
-            if (attributes.requestsNoSuggestions && separator != " ") return null
+            if (attributes.requestsNoSuggestions && separator != " ") return skip("address bar, only space corrects")
             when (state.flags.keyVariation) {
-                KeyVariation.PASSWORD, KeyVariation.EMAIL_ADDRESS, KeyVariation.URI -> return null
+                KeyVariation.PASSWORD, KeyVariation.EMAIL_ADDRESS, KeyVariation.URI ->
+                    return skip("field type ${state.flags.keyVariation}")
                 else -> {}
             }
             val content = state.content
             val selection = content.selection
-            if (selection.isNotCollapsed()) return null
+            if (selection.isNotCollapsed()) return skip("text is selected")
             val textBefore = content.surroundingText.textBefore
             val textAfter = content.surroundingText.textAfter
-            if (textAfter.isNotEmpty() && LatinTextAnalysis.isWordChar(textAfter[0])) return null
+            if (textAfter.isNotEmpty() && LatinTextAnalysis.isWordChar(textAfter[0])) {
+                return skip("cursor is inside a word")
+            }
             val currentWord = LatinTextAnalysis.currentWord(textBefore)
-            if (currentWord.isEmpty()) return null
+            if (currentWord.isEmpty()) {
+                return skip("no word before the cursor (keyboard sees ${textBefore.length} chars, cursor ${selection.min})")
+            }
+            // The user just undid the correction of this very word, ending it again keeps it as typed
+            if (selection.min == revertedWordEnd && currentWord == revertedWord) {
+                return skip("this correction was undone")
+            }
             val nlpManager = FlorisApplication.getHack().nlpManager.value
-            val candidate = nlpManager.getAutoCommitCandidate() as? AutoCorrectionCandidate ?: return null
-            // Suggestions are computed asynchronously, make sure this one belongs to the word being ended
-            if (candidate.originalWord != currentWord) return null
+            // Hint for undoing an accidental space right after the previous correction, see the field's docs
+            val recent = recentSpaceAutoCorrection
+            val previousCorrection = recent
+                ?.takeIf { it.cursorAfter == selection.min - currentWord.length }
+                ?.let { it.candidate.text.toString() to it.candidate.originalText }
+            // Decided right now instead of taken from the suggestion bar, which may not have caught up yet
+            val ownCorrection = nlpManager.computeAutoCorrection(
+                textBefore, selection.min, previousCorrection, touchTraceFor(currentWord, selection.min),
+            )
+            // Undoing an accidental space already rewrote the word before, there is nothing left to look back at
+            val isMerge = ownCorrection != null && ownCorrection.originalText.contains(' ')
+            val candidate = if (isMerge) {
+                ownCorrection
+            } else {
+                val nextFinal = ownCorrection?.takeIf { it.originalText == currentWord }?.text?.toString()
+                    ?: currentWord
+                val lookBack = try {
+                    lookBackCandidate(textBefore, selection.min, currentWord, nextFinal, recent)
+                } catch (e: Exception) {
+                    flogError { "Look-back failed: ${e.stackTraceToString()}" }
+                    null
+                }
+                lookBack ?: ownCorrection
+            } ?: return null
+            val original = candidate.originalText
             val corrected = candidate.text.toString()
+            if (original.isEmpty() || !textBefore.endsWith(original) || corrected == original) return null
+            if (selection.min < original.length) return null
             nlpManager.notifySuggestionAccepted(candidate)
-            if (!state.editor.commitReplacingBefore(currentWord.length, corrected)) return null
+            if (!state.editor.commitReplacingBefore(original.length, corrected)) return null
             resetContent(
-                K3TextRange(selection.min - currentWord.length + corrected.length),
+                K3TextRange(selection.min - original.length + corrected.length),
                 K3SurroundingText(
-                    textBefore = textBefore.dropLast(currentWord.length) + corrected,
+                    textBefore = textBefore.dropLast(original.length) + corrected,
                     textSelected = "",
                     textAfter = textAfter,
                 ),
             )
             expectedContentQueue.push(state.content)
             return AppliedAutoCorrection(candidate, separator, cursorAfter = -1)
+        }
+
+        /**
+         * Asks whether the word before [currentWord] should change now that the word after it is known ("its a"
+         * becomes "it's a"). Returns a correction covering both words, or null.
+         *
+         * @param nextFinal [currentWord] after its own auto-correction.
+         * @param recent The auto-correction applied when the earlier word was ended, if any, to learn what the user
+         *  actually typed for it.
+         */
+        private fun lookBackCandidate(
+            textBefore: String,
+            cursor: Int,
+            currentWord: String,
+            nextFinal: String,
+            recent: AppliedAutoCorrection?,
+        ): AutoCorrectionCandidate? {
+            val beforeCurrent = textBefore.dropLast(currentWord.length)
+            // Only a single plain space between the two words, anything else is a deliberate break
+            if (!beforeCurrent.endsWith(" ") || beforeCurrent.endsWith("  ")) return null
+            val beforeSpace = beforeCurrent.dropLast(1)
+            val visible = LatinTextAnalysis.currentWord(beforeSpace)
+            if (visible.isEmpty()) return null
+            val visibleEnd = cursor - currentWord.length - 1
+            if (visibleEnd == revertedWordEnd) return null
+            // The whole earlier word must be in the captured text, not cut off at its start
+            val textBeforeVisible = beforeSpace.dropLast(visible.length)
+            val visibleStart = visibleEnd - visible.length
+            if (textBeforeVisible.isEmpty() && visibleStart > 0) return null
+            val typed = recent
+                ?.takeIf { it.cursorAfter == cursor - currentWord.length }
+                ?.candidate
+                ?.takeIf { !it.originalText.contains(' ') || it.text.contains(' ') }
+                ?.takeIf { it.text.toString().substringAfterLast(' ') == visible }
+                ?.originalText
+                ?.substringAfterLast(' ')
+                ?: visible
+            val nlpManager = FlorisApplication.getHack().nlpManager.value
+            return nlpManager.computeLookBack(textBeforeVisible, visibleStart, visible, typed, currentWord, nextFinal)
         }
 
         /**
@@ -376,8 +608,8 @@ class ImeController(
             if (selection.isNotCollapsed() || selection.min != applied.cursorAfter) return false
             val textBefore = content.surroundingText.textBefore
             val tail = applied.candidate.text.toString() + applied.separator
-            if (!textBefore.endsWith(tail)) return false
-            val original = applied.candidate.originalWord
+            if (!textBefore.endsWith(tail) || selection.min < tail.length) return false
+            val original = applied.candidate.originalText
             if (!state.editor.commitReplacingBefore(tail.length, original)) return false
             resetContent(
                 K3TextRange(selection.min - tail.length + original.length),
@@ -494,11 +726,38 @@ class ImeController(
         override fun emitBackspace() {
             val applied = lastAutoCorrection
             lastAutoCorrection = null
-            if (applied != null && revertAutoCorrection(applied)) {
+            recentSpaceAutoCorrection = null
+            val reverted = applied != null && try {
+                revertAutoCorrection(applied)
+            } catch (e: Exception) {
+                flogError { "Undoing auto-correct failed: ${e.stackTraceToString()}" }
+                false
+            }
+            if (reverted) {
+                revertedWordEnd = state.content.selection.min
+                revertedWord = applied.candidate.originalText.substringAfterLast(' ')
+                wordTouches.clear()
+                wordTouchEnd = -1
                 return
             }
-            super.emitBackspace()
+            val cursorBefore = state.content.selection.min
+            try {
+                super.emitBackspace()
+            } catch (e: Exception) {
+                recoverFromError("Backspace", e)
+                return
+            }
             expectedContentQueue.push(state.content)
+            // Deleting the last typed letter drops its touch point, anything else forgets them
+            if (wordTouches.isNotEmpty() && cursorBefore == wordTouchEnd &&
+                state.content.selection.min == cursorBefore - 1
+            ) {
+                wordTouches.removeAt(wordTouches.lastIndex)
+                wordTouchEnd = state.content.selection.min
+            } else {
+                wordTouches.clear()
+                wordTouchEnd = -1
+            }
         }
 
         override fun emitEnter() {
@@ -603,10 +862,15 @@ class ImeController(
             if (candidate is EmojiSuggestionCandidate) {
                 replaceLength = emojiQueryLength(textBefore)
                 suffix = ""
+            } else if (candidate is AutoCorrectionCandidate && textBefore.endsWith(candidate.originalText)) {
+                // May span two fragments, e.g. the merge of an accidental space
+                replaceLength = candidate.originalText.length
+                suffix = if (textAfter.firstOrNull()?.isWhitespace() == true) "" else " "
             } else {
                 replaceLength = LatinTextAnalysis.currentWord(textBefore).length
                 suffix = if (textAfter.firstOrNull()?.isWhitespace() == true) "" else " "
             }
+            if (replaceLength > selection.min || replaceLength > textBefore.length) return false
             // Step over an existing space instead of inserting a second one
             val cursorOffset = if (suffix.isEmpty() && candidate !is EmojiSuggestionCandidate) 1 else 0
             val insertText = text + suffix
@@ -754,6 +1018,8 @@ class ImeController(
         private val NEWLINE_SEQ = "\n".asK3String()
 
         private const val AUTO_CORRECT_SEPARATORS = " .,!?;:"
+        /** An editor answering slower than this is logged, since the keyboard waits for it. */
+        private const val SLOW_EDITOR_MS = 300L
     }
 }
 
@@ -781,6 +1047,14 @@ private class ExpectedContentQueue {
 
     fun push(item: K3Content) {
         list.add(item)
+        // Editors that never report selection updates would otherwise make this grow forever
+        if (list.size > MAX_SIZE) {
+            list.removeAt(0)
+        }
+    }
+
+    companion object {
+        private const val MAX_SIZE = 64
     }
 
     fun clear() {

@@ -27,6 +27,8 @@ import dev.patrickgold.florisboard.ime.nlp.SuggestionCandidate
 import dev.patrickgold.florisboard.ime.nlp.SuggestionProvider
 import dev.patrickgold.florisboard.ime.nlp.WordSuggestionCandidate
 import dev.patrickgold.florisboard.lib.devtools.flogError
+import dev.patrickgold.florisboard.lib.devtools.flogWarning
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -38,6 +40,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.builtins.MapSerializer
 import kotlinx.serialization.builtins.serializer
 import kotlinx.serialization.json.Json
@@ -52,10 +55,32 @@ class LatinLanguageProvider(context: Context) : SpellingProvider, SuggestionProv
         const val ProviderId = "org.florisboard.nlp.providers.latin"
 
         private const val DICTIONARY_ASSET = "ime/dict/data.json"
+        private const val BIGRAMS_ASSET = "ime/dict/bigrams.tsv"
+        private const val UNVERIFIED_ASSET = "ime/dict/unverified.txt"
+        private const val VALID_ASSET = "ime/dict/valid.txt"
         private const val USER_MODEL_DIR = "nlp"
         private const val USER_MODEL_FILE = "latin_user_model.json"
         private const val SAVE_DELAY_MS = 5_000L
+
+        /**
+         * Longest the editor waits for the dictionary when a word is ended. The wait happens while a key press is
+         * being handled, so past this the correction is skipped rather than freezing the keyboard.
+         */
+        private const val EDITOR_LOCK_TIMEOUT_MS = 120L
+        /**
+         * Longest a spell check request waits for the dictionary. Browsers send whole paragraphs at once, and
+         * those checks must never pile up in front of the typing itself.
+         */
+        private const val SPELL_LOCK_TIMEOUT_MS = 400L
+        private const val SPELL_LOCK_POLL_MS = 8L
     }
+
+    /** The auto-correction the suggestion bar computed for an exact editor state, reused when the word is ended. */
+    private class CachedAutoCorrection(
+        val textBefore: String,
+        val cursor: Int,
+        val correction: LatinAutoCorrection?,
+    )
 
     private val appContext by context.appContext()
     private val prefs by FlorisPreferenceStore
@@ -65,12 +90,39 @@ class LatinLanguageProvider(context: Context) : SpellingProvider, SuggestionProv
 
     // Guarded by engineLock
     private val engineLock = Mutex()
+    // Volatile so the editor can check readiness without waiting on engineLock
+    @Volatile
     private var engine: LatinSuggestionEngine? = null
     private var wordData: Map<String, Int> = emptyMap()
     private var saveJob: Job? = null
 
     // Guarded by synchronized(learningTracker), kept off engineLock so candidate taps never wait on a suggestion run
     private val learningTracker = LatinLearningTracker()
+
+    @Volatile
+    private var cachedAutoCorrection: CachedAutoCorrection? = null
+
+    /** Drops the cached auto-correction, called when the user undoes one so it is never applied again. */
+    fun forgetCachedAutoCorrection() {
+        cachedAutoCorrection = null
+    }
+
+    /**
+     * Runs [block] with the engine for the editor, waiting at most [EDITOR_LOCK_TIMEOUT_MS] for a suggestion run
+     * to finish. Returns null if the dictionary is not loaded yet or the wait timed out.
+     */
+    private suspend fun <T> withEngineForEditor(block: (LatinSuggestionEngine) -> T): T? {
+        if (engine == null) {
+            flogWarning { "Dictionary not loaded yet, auto-correct skipped" }
+            return null
+        }
+        var finished = false
+        val result = withTimeoutOrNull(EDITOR_LOCK_TIMEOUT_MS) {
+            engineLock.withLock { block(ensureEngineLocked()) }.also { finished = true }
+        }
+        if (!finished) flogWarning { "Dictionary busy for ${EDITOR_LOCK_TIMEOUT_MS}ms, auto-correct skipped" }
+        return result
+    }
 
     override val providerId = ProviderId
 
@@ -93,7 +145,33 @@ class LatinLanguageProvider(context: Context) : SpellingProvider, SuggestionProv
         engine?.let { return it }
         val rawData = appContext.assets.readText(DICTIONARY_ASSET)
         val dictionary = json.decodeFromString(wordDataSerializer, rawData)
-        val newEngine = LatinSuggestionEngine(dictionary)
+        // The next-word model and unverified list improve predictions and corrections, but are optional
+        val bigrams = try {
+            LatinBigramModel.parse(appContext.assets.readText(BIGRAMS_ASSET))
+        } catch (e: Exception) {
+            flogError { "Failed to load next-word model: $e" }
+            LatinBigramModel.Empty
+        } catch (e: OutOfMemoryError) {
+            flogError { "Not enough memory for the next-word model: $e" }
+            LatinBigramModel.Empty
+        }
+        val unverified = try {
+            appContext.assets.readText(UNVERIFIED_ASSET).lineSequence()
+                .filter { it.isNotEmpty() && !it.startsWith("#") }
+                .toHashSet()
+        } catch (e: Exception) {
+            flogError { "Failed to load unverified word list: $e" }
+            emptySet()
+        }
+        val valid = try {
+            appContext.assets.readText(VALID_ASSET).lineSequence()
+                .filter { it.isNotEmpty() && !it.startsWith("#") }
+                .toHashSet()
+        } catch (e: Exception) {
+            flogError { "Failed to load the real word list: $e" }
+            emptySet()
+        }
+        val newEngine = LatinSuggestionEngine(dictionary, bigrams, unverified, valid)
         try {
             val file = userModelFile()
             if (file.exists()) {
@@ -147,8 +225,26 @@ class LatinLanguageProvider(context: Context) : SpellingProvider, SuggestionProv
         allowPossiblyOffensive: Boolean,
         isPrivateSession: Boolean,
     ): SpellingResult {
-        val corrections = engineLock.withLock {
-            ensureEngineLocked().spellCheck(word, maxSuggestionCount)
+        // The spell checker runs in the keyboard's process, an error here must not close the keyboard
+        val corrections = try {
+            // Polled instead of queued on the lock: a queued check would hold up the editor behind it, and
+            // browsers send dozens at once for a long paragraph
+            var waited = 0L
+            while (!engineLock.tryLock()) {
+                if (waited >= SPELL_LOCK_TIMEOUT_MS) return SpellingResult.unspecified()
+                delay(SPELL_LOCK_POLL_MS)
+                waited += SPELL_LOCK_POLL_MS
+            }
+            try {
+                ensureEngineLocked().spellCheck(word, maxSuggestionCount)
+            } finally {
+                engineLock.unlock()
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            flogError { "Spell check failed: ${e.stackTraceToString()}" }
+            return SpellingResult.unspecified()
         }
         return when (corrections) {
             null -> SpellingResult.validWord()
@@ -158,6 +254,21 @@ class LatinLanguageProvider(context: Context) : SpellingProvider, SuggestionProv
 
     override suspend fun suggest(
         subtype: Subtype,
+        content: K3Content,
+        maxCandidateCount: Int,
+        allowPossiblyOffensive: Boolean,
+        isPrivateSession: Boolean,
+    ): List<SuggestionCandidate> {
+        // A bug in here must never take the whole keyboard down, losing suggestions for one keystroke is fine
+        return try {
+            suggestUnsafe(content, maxCandidateCount, allowPossiblyOffensive, isPrivateSession)
+        } catch (e: Exception) {
+            flogError { "Suggestion failed: ${e.stackTraceToString()}" }
+            emptyList()
+        }
+    }
+
+    private suspend fun suggestUnsafe(
         content: K3Content,
         maxCandidateCount: Int,
         allowPossiblyOffensive: Boolean,
@@ -181,7 +292,10 @@ class LatinLanguageProvider(context: Context) : SpellingProvider, SuggestionProv
             learningTracker.observe(textBefore, selection.min, hasMoreBefore, currentWord)
         }
 
-        val result = engineLock.withLock {
+        val autoCorrectEnabled = prefs.correction.autoCorrect.get()
+        var autoCorrection: LatinAutoCorrection? = null
+        var analyzed = false
+        val words = engineLock.withLock {
             val currentEngine = ensureEngineLocked()
             if (learnable != null && !isPrivateSession) {
                 if (currentEngine.learn(learnable.previous, learnable.word)) {
@@ -190,26 +304,31 @@ class LatinLanguageProvider(context: Context) : SpellingProvider, SuggestionProv
             }
             if (currentWord.isEmpty()) {
                 val previous = LatinTextAnalysis.previousWord(textBefore, hasMoreBefore)
-                LatinSuggestionResult(
-                    words = currentEngine.predictNext(previous, maxCandidateCount, allowPossiblyOffensive),
-                    autoCorrection = null,
-                )
+                currentEngine.predictNext(previous, maxCandidateCount, allowPossiblyOffensive)
             } else {
                 val textBeforeWord = textBefore.substring(0, textBefore.length - currentWord.length)
-                val previous = LatinTextAnalysis.previousWord(textBeforeWord, hasMoreBefore)
-                currentEngine.suggestDetailed(currentWord, previous, maxCandidateCount, allowPossiblyOffensive)
+                // Same decision the keyboard makes when the word is ended, so the bar previews it exactly and the
+                // keyboard can reuse it without searching again
+                val analysis = currentEngine.analyze(
+                    currentWord, textBeforeWord, hasMoreBefore, maxCandidateCount, allowPossiblyOffensive,
+                    withAutoCorrection = autoCorrectEnabled,
+                )
+                autoCorrection = analysis.autoCorrection
+                analyzed = autoCorrectEnabled
+                analysis.words
             }
         }
+        if (analyzed) {
+            cachedAutoCorrection = CachedAutoCorrection(textBefore, selection.min, autoCorrection)
+        }
 
-        val autoCorrection = result.autoCorrection.takeIf { prefs.correction.autoCorrect.get() }
-        return result.words.mapIndexed { index, word ->
-            if (index == 0 && word == autoCorrection) {
-                AutoCorrectionCandidate(
-                    text = word,
-                    originalWord = currentWord,
-                    sourceProvider = this,
-                )
-            } else {
+        val candidates = ArrayList<SuggestionCandidate>(words.size + 1)
+        autoCorrection?.let {
+            candidates.add(AutoCorrectionCandidate(it.replacement, it.replacedText, sourceProvider = this))
+        }
+        for ((index, word) in words.withIndex()) {
+            if (word == autoCorrection?.replacement) continue
+            candidates.add(
                 WordSuggestionCandidate(
                     text = word,
                     confidence = (1.0 - index * 0.05).coerceAtLeast(0.1),
@@ -217,7 +336,75 @@ class LatinLanguageProvider(context: Context) : SpellingProvider, SuggestionProv
                     isEligibleForUserRemoval = true,
                     sourceProvider = this,
                 )
+            )
+        }
+        return candidates.take(maxCandidateCount)
+    }
+
+    /**
+     * Decides the auto-correction for the word directly before the cursor, called by the editor at the moment the
+     * user ends it. Returns null if nothing should change.
+     *
+     * @param previousCorrection See [LatinSuggestionEngine.autoCorrect].
+     */
+    suspend fun autoCorrect(
+        textBefore: String,
+        cursor: Int,
+        allowPossiblyOffensive: Boolean,
+        previousCorrection: Pair<String, String>?,
+        touches: LatinTouchTrace? = null,
+    ): AutoCorrectionCandidate? {
+        // Called on the main thread when a word is ended: never wait for the dictionary to load, skip this one
+        if (engine == null) return null
+        return try {
+            val currentWord = LatinTextAnalysis.currentWord(textBefore)
+            if (currentWord.isEmpty()) return null
+            val cached = cachedAutoCorrection
+            val correction = if (
+                previousCorrection == null && touches == null && cached != null && cached.cursor == cursor &&
+                cached.textBefore == textBefore
+            ) {
+                // The suggestion bar already decided for this exact text. With touch points the decision is made
+                // again, since the bar only knows the letters.
+                cached.correction
+            } else {
+                val textBeforeWord = textBefore.substring(0, textBefore.length - currentWord.length)
+                val hasMoreBefore = cursor > textBefore.length
+                withEngineForEditor {
+                    it.autoCorrect(
+                        currentWord, textBeforeWord, hasMoreBefore, allowPossiblyOffensive, previousCorrection, touches,
+                    )
+                }
+            } ?: return null
+            AutoCorrectionCandidate(correction.replacement, correction.replacedText, sourceProvider = this)
+        } catch (e: Exception) {
+            flogError { "Auto-correct failed: ${e.stackTraceToString()}" }
+            null
+        }
+    }
+
+    /**
+     * Takes a second look at the word before the one being ended, see [LatinSuggestionEngine.lookBack].
+     *
+     * @param textBeforeWord The text before the earlier word.
+     * @param cursor The absolute position of the end of [textBeforeWord].
+     */
+    suspend fun lookBack(
+        textBeforeWord: String,
+        cursor: Int,
+        visible: String,
+        typed: String,
+        next: String,
+        allowPossiblyOffensive: Boolean,
+    ): String? {
+        return try {
+            val hasMoreBefore = cursor > textBeforeWord.length
+            withEngineForEditor {
+                it.lookBack(textBeforeWord, hasMoreBefore, visible, typed, next, allowPossiblyOffensive)
             }
+        } catch (e: Exception) {
+            flogError { "Look-back failed: ${e.stackTraceToString()}" }
+            null
         }
     }
 
@@ -229,8 +416,18 @@ class LatinLanguageProvider(context: Context) : SpellingProvider, SuggestionProv
         if (candidate !is AutoCorrectionCandidate) return
         // The user undid the correction, so what they typed is a word they want to keep
         synchronized(learningTracker) { learningTracker.onCandidateReverted() }
+        // A correction can span two words ("do home" to "go home"), only the words it changed are kept
+        val originals = candidate.originalText.split(' ')
+        val replacements = candidate.text.toString().split(' ')
+        val kept = if (originals.size == replacements.size) {
+            originals.filterIndexed { index, word -> word != replacements[index] }
+        } else {
+            emptyList()
+        }
+        if (kept.isEmpty()) return
         engineLock.withLock {
-            if (ensureEngineLocked().acceptWord(candidate.originalWord)) {
+            val currentEngine = ensureEngineLocked()
+            if (kept.map { currentEngine.acceptWord(it) }.any { it }) {
                 scheduleSaveLocked()
             }
         }

@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+@file:OptIn(kotlinx.coroutines.FlowPreview::class)
+
 package dev.patrickgold.florisboard.ime.nlp
 
 import android.content.Context
@@ -27,15 +29,21 @@ import dev.patrickgold.florisboard.ime.core.Subtype
 import dev.patrickgold.florisboard.ime.keyboard3.ImeState
 import dev.patrickgold.florisboard.ime.media.emoji.EmojiSuggestionProvider
 import dev.patrickgold.florisboard.ime.nlp.latin.LatinLanguageProvider
+import dev.patrickgold.florisboard.ime.nlp.latin.LatinTouchTrace
 import dev.patrickgold.florisboard.ime.text.key.KeyVariation
 import dev.patrickgold.florisboard.inferFlorisApplication
+import dev.patrickgold.florisboard.lib.devtools.flogError
 import dev.patrickgold.florisboard.lib.util.NetworkUtils
 import dev.patrickgold.florisboard.subtypeManager
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.conflate
+import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.update
@@ -54,6 +62,11 @@ import kotlin.properties.Delegates
 private const val BLANK_STR_PATTERN = "^\\s*$"
 
 class NlpManager(context: Context) {
+    private companion object {
+        /** Same as AOSP LatinIME's config_delay_in_milliseconds_to_update_suggestions. */
+        const val SUGGESTION_UPDATE_DELAY_MS = 100L
+    }
+
     private val blankStrRegex = Regex(BLANK_STR_PATTERN)
 
     private val prefs by FlorisPreferenceStore
@@ -62,12 +75,19 @@ class NlpManager(context: Context) {
     private val clipboardManager by context.clipboardManager()
     private val subtypeManager by context.subtypeManager()
 
-    private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+    // Suggestions are optional: an error in a provider is logged instead of crashing the keyboard process
+    private val scope = CoroutineScope(
+        Dispatchers.Default + SupervisorJob() + CoroutineExceptionHandler { _, e ->
+            flogError { "Suggestion task failed: ${e.stackTraceToString()}" }
+        }
+    )
     private val clipboardSuggestionProvider = ClipboardSuggestionProvider(context)
     private val emojiSuggestionProvider = EmojiSuggestionProvider(context)
+    // Kept directly so the editor can reach it without the providers lock, which preloading holds for seconds
+    private val latinProvider = LatinLanguageProvider(context)
     private val providers = guardedByLock {
         mapOf(
-            LatinLanguageProvider.ProviderId to ProviderInstanceWrapper(LatinLanguageProvider(context)),
+            LatinLanguageProvider.ProviderId to ProviderInstanceWrapper(latinProvider),
             //HanShapeBasedLanguageProvider.ProviderId to ProviderInstanceWrapper(HanShapeBasedLanguageProvider(context)),
         )
     }
@@ -109,18 +129,32 @@ class NlpManager(context: Context) {
         imeController.activeState
             .map { state -> SuggestionRequest.of(state) }
             .distinctUntilChanged { old, new -> old?.key == new?.key }
+            // Like AOSP LatinIME, which posts its suggestion update with a 100 ms delay and replaces it on every key
+            // press: while the user types quickly only the state they pause on is worked out. The word they end
+            // with a space is corrected on the spot regardless, see computeAutoCorrection.
+            .debounce(SUGGESTION_UPDATE_DELAY_MS)
+            // While one request runs, only the newest waiting one is kept, so the work never falls behind
+            .conflate()
             .collectIn(scope) { request ->
                 // Processed in order on purpose: providers learn from the sequence of editor states, and running
-                // requests concurrently would let a later keystroke finish before an earlier one
-                if (request == null) {
-                    clearSuggestions()
-                } else {
-                    computeSuggestions(
-                        subtype = subtypeManager.activeSubtype,
-                        content = request.content,
-                        isPrivateSession = request.isPrivateSession,
-                        reqTime = SystemClock.uptimeMillis(),
-                    )
+                // requests concurrently would let a later keystroke finish before an earlier one. Skipped states
+                // are fine, the learning tracker is built for gaps.
+                // Caught here so one failure does not end the collection and with it all future suggestions
+                try {
+                    if (request == null) {
+                        clearSuggestions()
+                    } else {
+                        computeSuggestions(
+                            subtype = subtypeManager.activeSubtype,
+                            content = request.content,
+                            isPrivateSession = request.isPrivateSession,
+                            reqTime = SystemClock.uptimeMillis(),
+                        )
+                    }
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    flogError { "Suggestion update failed: ${e.stackTraceToString()}" }
                 }
             }
     }
@@ -328,9 +362,77 @@ class NlpManager(context: Context) {
     /**
      * Tells the candidate's provider that its automatic commit was undone by the user.
      */
+    /**
+     * Decides, right now, how to auto-correct the word directly before the cursor when the user ends it. Runs
+     * synchronously so the result never depends on the asynchronous suggestion bar having caught up.
+     *
+     * @param previousCorrection The visible and original text of an auto-correction applied right before the space
+     *  in front of the current word, if any.
+     */
+    fun computeAutoCorrection(
+        textBefore: String,
+        cursor: Int,
+        previousCorrection: Pair<String, String>?,
+        touches: LatinTouchTrace? = null,
+    ): AutoCorrectionCandidate? {
+        if (subtypeManager.activeSubtype.nlpProviders.suggestion != LatinLanguageProvider.ProviderId) return null
+        return runBlocking {
+            latinProvider.autoCorrect(
+                textBefore = textBefore,
+                cursor = cursor,
+                allowPossiblyOffensive = !prefs.suggestion.blockPossiblyOffensive.get(),
+                previousCorrection = previousCorrection,
+                touches = touches,
+            )
+        }
+    }
+
+    /**
+     * Takes a second look at the word before the one being ended, now that the word after it is known. Runs
+     * synchronously like [computeAutoCorrection].
+     *
+     * @param textBeforeWord The text before the earlier word.
+     * @param cursor The absolute position of the end of [textBeforeWord].
+     * @param visible The earlier word as it stands in the editor.
+     * @param typed What the user typed for the earlier word, differs from [visible] if it was auto-corrected.
+     * @param nextOriginal The word being ended, as it stands in the editor.
+     * @param nextFinal The word being ended, after its own auto-correction.
+     * @return A correction replacing "[visible] [nextOriginal]" with the fixed earlier word and [nextFinal], or
+     *  null to leave the earlier word as it is.
+     */
+    fun computeLookBack(
+        textBeforeWord: String,
+        cursor: Int,
+        visible: String,
+        typed: String,
+        nextOriginal: String,
+        nextFinal: String,
+    ): AutoCorrectionCandidate? {
+        if (subtypeManager.activeSubtype.nlpProviders.suggestion != LatinLanguageProvider.ProviderId) return null
+        val replacement = runBlocking {
+            latinProvider.lookBack(
+                textBeforeWord = textBeforeWord,
+                cursor = cursor,
+                visible = visible,
+                typed = typed,
+                next = nextFinal,
+                allowPossiblyOffensive = !prefs.suggestion.blockPossiblyOffensive.get(),
+            )
+        } ?: return null
+        if (replacement == visible) return null
+        return AutoCorrectionCandidate(
+            text = "$replacement $nextFinal",
+            originalText = "$visible $nextOriginal",
+            sourceProvider = latinProvider,
+        )
+    }
+
     fun notifySuggestionReverted(candidate: SuggestionCandidate) {
         val subtype = subtypeManager.activeSubtype
-        runBlocking {
+        // The cached decision for this text is the correction that was just rejected
+        latinProvider.forgetCachedAutoCorrection()
+        // Learning that the user kept their word needs the dictionary, which must not hold up the backspace
+        scope.launch {
             candidate.sourceProvider?.notifySuggestionReverted(subtype, candidate)
         }
     }

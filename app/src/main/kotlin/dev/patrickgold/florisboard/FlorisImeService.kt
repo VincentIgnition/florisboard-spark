@@ -422,10 +422,11 @@ class FlorisImeService : LifecycleInputMethodService() {
             return
         }
         hasSelectionUpdates = true
+        val oldSelection = K3TextRange(start = oldSelStart, end = oldSelEnd)
         val newSelection = K3TextRange(start = newSelStart, end = newSelEnd)
-        flogInfo { "new=$newSelection" }
+        flogInfo { "old=$oldSelection new=$newSelection" }
         imeController.updateStateBlocking {
-            handleUpdateSelection(newSelection)
+            handleUpdateSelection(oldSelection, newSelection)
         }
     }
 

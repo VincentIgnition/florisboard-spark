@@ -49,6 +49,8 @@ object Devtools {
             append(generateSystemInfoLog(context))
             appendLine()
             append(generateAppInfoLog(context))
+            appendLine()
+            append(generateRecentExitsLog(context))
             if (prefs != null) {
                 appendLine()
                 append(generateFeatureConfigLog(prefs))
@@ -82,6 +84,87 @@ object Devtools {
                 appendLine("</details>")
             }
         }
+    }
+
+    /**
+     * Why the keyboard's process ended the last few times, as recorded by Android (crash, freeze, out of memory,
+     * killed), plus saved stack traces of crashes. Lets a crash be diagnosed after the fact.
+     */
+    fun generateRecentExitsLog(context: Context, withTitle: Boolean = true): String {
+        return buildString {
+            if (withTitle) appendLine("======= RECENT EXITS =======")
+            try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                    val am = context.getSystemService(ActivityManager::class.java)
+                    val exits = am?.getHistoricalProcessExitReasons(context.packageName, 0, 8).orEmpty()
+                    if (exits.isEmpty()) appendLine("No exits recorded")
+                    for (exit in exits) {
+                        append(java.time.Instant.ofEpochMilli(exit.timestamp).toString())
+                        append("  ").append(exitReasonName(exit.reason))
+                        append("  process=").append(exit.processName)
+                        append("  importance=").append(exit.importance)
+                        append("  pss=").append(exit.pss / 1024).append("MB")
+                        append("  rss=").append(exit.rss / 1024).appendLine("MB")
+                        exit.description?.let { append("  ").appendLine(it) }
+                        if (exit.reason == android.app.ApplicationExitInfo.REASON_ANR ||
+                            exit.reason == android.app.ApplicationExitInfo.REASON_CRASH_NATIVE
+                        ) {
+                            append(mainThreadTrace(exit))
+                        }
+                    }
+                } else {
+                    appendLine("Exit reasons need Android 11 or newer")
+                }
+            } catch (e: Exception) {
+                append("Exit reasons unavailable: ").appendLine(e.toString())
+            }
+            val stacktraces = try {
+                dev.patrickgold.florisboard.lib.crashutility.CrashUtility.peekUnhandledStacktraces(context, 3)
+            } catch (e: Exception) {
+                emptyList()
+            }
+            for (stacktrace in stacktraces) {
+                appendLine()
+                append("--- Saved crash ").append(stacktrace.name).appendLine(" ---")
+                appendLine(stacktrace.details.lines().take(80).joinToString("\n"))
+            }
+        }
+    }
+
+    private fun exitReasonName(reason: Int): String {
+        return when (reason) {
+            android.app.ApplicationExitInfo.REASON_ANR -> "FROZE (ANR)"
+            android.app.ApplicationExitInfo.REASON_CRASH -> "CRASH"
+            android.app.ApplicationExitInfo.REASON_CRASH_NATIVE -> "NATIVE CRASH"
+            android.app.ApplicationExitInfo.REASON_LOW_MEMORY -> "LOW MEMORY"
+            android.app.ApplicationExitInfo.REASON_EXCESSIVE_RESOURCE_USAGE -> "EXCESSIVE RESOURCE USAGE"
+            android.app.ApplicationExitInfo.REASON_SIGNALED -> "KILLED BY SIGNAL"
+            android.app.ApplicationExitInfo.REASON_EXIT_SELF -> "EXITED"
+            android.app.ApplicationExitInfo.REASON_USER_REQUESTED -> "USER REQUESTED"
+            android.app.ApplicationExitInfo.REASON_USER_STOPPED -> "USER STOPPED"
+            android.app.ApplicationExitInfo.REASON_DEPENDENCY_DIED -> "DEPENDENCY DIED"
+            android.app.ApplicationExitInfo.REASON_PERMISSION_CHANGE -> "PERMISSION CHANGE"
+            android.app.ApplicationExitInfo.REASON_INITIALIZATION_FAILURE -> "INITIALIZATION FAILURE"
+            android.app.ApplicationExitInfo.REASON_OTHER -> "OTHER"
+            else -> "UNKNOWN ($reason)"
+        }
+    }
+
+    /** The main thread's part of a freeze or native crash trace, which shows what the keyboard was stuck on. */
+    @androidx.annotation.RequiresApi(Build.VERSION_CODES.R)
+    private fun mainThreadTrace(exit: android.app.ApplicationExitInfo): String {
+        val lines = try {
+            exit.traceInputStream?.bufferedReader()?.use { it.readLines() }
+        } catch (e: Exception) {
+            null
+        } ?: return "  (no trace)\n"
+        val start = lines.indexOfFirst { it.startsWith("\"main\"") }
+        val section = if (start >= 0) {
+            lines.drop(start).takeWhile { it.isNotBlank() }
+        } else {
+            lines.take(60)
+        }
+        return section.take(80).joinToString("\n", postfix = "\n") { "  $it" }
     }
 
     fun generateSystemInfoLog(context: Context, withTitle: Boolean = true): String {

@@ -19,6 +19,7 @@ package dev.patrickgold.florisboard.ime.keyboard3
 import android.content.ClipDescription
 import android.content.ContentUris
 import android.net.Uri
+import android.os.Build
 import android.os.SystemClock
 import android.view.KeyCharacterMap
 import android.view.KeyEvent
@@ -63,6 +64,30 @@ open class ImeEditor(
             textBefore = textBeforeCursor.toString(),
             textSelected = textSelected.toString(),
             textAfter = textAfterCursor.toString(),
+        )
+    }
+
+    /**
+     * Reads the cursor position and the text around it in one call, so both describe the same moment. Returns
+     * null before Android 12 or if the editor does not answer, in which case callers fall back to separate reads.
+     */
+    fun getSurroundingSnapshot(charsBefore: Int, charsAfter: Int): Pair<K3TextRange, K3SurroundingText>? {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return null
+        val ic = ic.get() ?: return null
+        val surrounding = try {
+            ic.getSurroundingText(charsBefore, charsAfter, 0)
+        } catch (e: Exception) {
+            null
+        } ?: return null
+        val text = surrounding.text
+        val start = surrounding.selectionStart
+        val end = surrounding.selectionEnd
+        if (start < 0 || end < start || end > text.length || surrounding.offset < 0) return null
+        val selection = K3TextRange(surrounding.offset + start, surrounding.offset + end)
+        return selection to K3SurroundingText(
+            textBefore = text.subSequence(0, start).toString(),
+            textSelected = text.subSequence(start, end).toString(),
+            textAfter = text.subSequence(end, text.length).toString(),
         )
     }
 

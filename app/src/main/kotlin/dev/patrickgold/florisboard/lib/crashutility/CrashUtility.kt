@@ -197,6 +197,20 @@ abstract class CrashUtility private constructor() {
             return retList.toList()
         }
 
+        /**
+         * Reads the newest unhandled stacktrace files without deleting them, so crashes stay visible in the debug
+         * log even when the crash notification never showed (notifications turned off).
+         */
+        fun peekUnhandledStacktraces(context: Context, maxCount: Int): List<Stacktrace> {
+            val ustDir = context.getUstDir()
+            if (!ustDir.isDirectory) return emptyList()
+            return ustDir.listFiles { pathname -> pathname.name.endsWith(".$UNHANDLED_STACKTRACE_FILE_EXT") }
+                .orEmpty()
+                .sortedByDescending { it.name }
+                .take(maxCount)
+                .map { Stacktrace(it.name, readFile(it)) }
+        }
+
         fun hasUnhandledStacktraceFiles(context: Context): Boolean {
             val ustDir = context.getUstDir()
             return if (ustDir.isDirectory) {

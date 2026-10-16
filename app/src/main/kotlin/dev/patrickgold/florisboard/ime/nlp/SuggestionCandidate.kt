@@ -116,14 +116,16 @@ data class WordSuggestionCandidate(
 }
 
 /**
- * A word candidate that replaces [originalWord] automatically when the user ends the word with a space or
- * punctuation. Remembers the original so a backspace right after the correction can restore it.
+ * A candidate that replaces [originalText] automatically when the user ends the word with a space or punctuation.
+ * Remembers the original so a backspace right after the correction can restore it.
  *
+ * @property originalText The exact text directly before the cursor that gets replaced. Usually the word being typed,
+ *  but two fragments when an accidental space is undone ("abo ut" becomes "about").
  * @see SuggestionCandidate
  */
 data class AutoCorrectionCandidate(
     override val text: CharSequence,
-    val originalWord: String,
+    val originalText: String,
     override val sourceProvider: SuggestionProvider?,
 ) : SuggestionCandidate {
     override val secondaryText: CharSequence? = null

@@ -23,6 +23,10 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.geometry.Size
+import dev.patrickgold.florisboard.ime.keyboard3.touch.TouchLayer
+import dev.patrickgold.florisboard.ime.nlp.latin.LatinKeyLayout
+import dev.patrickgold.florisboard.ime.nlp.latin.LatinKeyTouch
+import org.k3lp.lib.text.K3String
 import androidx.compose.ui.input.pointer.PointerId
 import androidx.compose.ui.input.pointer.PointerInputChange
 import androidx.compose.ui.input.pointer.changedToDown
@@ -324,6 +328,11 @@ class PointerTracker(
         trackedOutputPointer.value?.takeIf { it.id == up.id }?.let { trackedPointer ->
             trackedPointer.longPress.extendedJob?.cancel()
             trackedPointer.repeatJob?.cancel()
+            val isPlainTap = trackedPointer.downKey != trackedMultiTapSeq.value?.touchKey &&
+                !trackedPointer.longPress.shouldShowExtendedPopup()
+            if (isPlainTap) {
+                noteTapPosition(trackedPointer.downKey, trackedPointer.down.position.normalized(size))
+            }
             imeController.updateState {
                 val output = when {
                     trackedPointer.downKey == trackedMultiTapSeq.value?.touchKey -> null
@@ -399,6 +408,41 @@ class PointerTracker(
     private suspend fun cancelMultiTap() {
         val multiTapSeq = trackedMultiTapSeq.getAndUpdate { null } ?: return
         multiTapSeq.commitJob?.cancel()
+    }
+
+    // Letter key centers of each layer, in key widths and heights, with the key size used as the unit
+    private val keyLayouts = java.util.IdentityHashMap<TouchLayer, Pair<LatinKeyLayout, Size>>()
+
+    private fun letterOf(key: TouchKey): Char? {
+        val output = key.attrs.output as? K3String ?: return null
+        val text = output.toText()
+        if (text.length != 1) return null
+        val c = text[0].lowercaseChar()
+        return if (c in 'a'..'z') c else null
+    }
+
+    private fun keyLayoutFor(key: TouchKey): Pair<LatinKeyLayout, Size>? {
+        val layer = touchKeyboard.layers.values.firstOrNull { layer -> layer.keys.any { it === key } } ?: return null
+        keyLayouts[layer]?.let { return it }
+        val letterKeys = layer.keys.filter { letterOf(it) != null }
+        // Only alphabetic layouts, not number pads or symbol pages
+        if (letterKeys.size < 20) return null
+        val unitWidth = letterKeys.map { it.bounds.width }.sorted()[letterKeys.size / 2]
+        val unitHeight = letterKeys.map { it.bounds.height }.sorted()[letterKeys.size / 2]
+        if (unitWidth <= 0f || unitHeight <= 0f) return null
+        val centers = letterKeys.associate { key ->
+            letterOf(key)!! to Pair(key.bounds.center.x / unitWidth, key.bounds.center.y / unitHeight)
+        }
+        val result = LatinKeyLayout(centers) to Size(unitWidth, unitHeight)
+        keyLayouts[layer] = result
+        return result
+    }
+
+    /** Tells the controller where the finger landed on a letter key, for touch aware auto-correct. */
+    private fun noteTapPosition(key: TouchKey, position: Offset) {
+        val letter = letterOf(key) ?: return
+        val (layout, unit) = keyLayoutFor(key) ?: return
+        imeController.notePendingTap(letter, LatinKeyTouch(position.x / unit.width, position.y / unit.height), layout)
     }
 
     private fun Offset.normalized(size: IntSize): Offset {

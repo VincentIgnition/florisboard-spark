@@ -95,9 +95,11 @@ class FlorisApplication : Application() {
         try {
             Flog.install(
                 context = this,
-                isFloggingEnabled = BuildConfig.DEBUG,
+                // Errors and warnings are logged in every build, so the debug log can show what went wrong on a
+                // real phone. Debug builds log everything.
+                isFloggingEnabled = true,
                 flogTopics = LogTopic.ALL,
-                flogLevels = Flog.LEVEL_ALL,
+                flogLevels = if (BuildConfig.DEBUG) Flog.LEVEL_ALL else Flog.LEVEL_ERROR or Flog.LEVEL_WARNING,
                 flogOutputs = Flog.OUTPUT_CONSOLE,
             )
             CrashUtility.install(this)

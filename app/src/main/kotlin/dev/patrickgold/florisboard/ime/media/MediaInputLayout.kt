@@ -67,7 +67,7 @@ fun MediaInputLayout(
     if (isGifSearch) {
         GifSearchLayout(onBack = { isGifSearch = false })
     } else if (isEmojiSearch) {
-        EmojiSearchLayout()
+        EmojiSearchLayout(onBack = { isEmojiSearch = false })
     } else {
         SnyggColumn(
             elementName = FlorisImeUi.Media.elementName,
@@ -91,22 +91,18 @@ fun MediaInputLayout(
                     modifier = Modifier.fillMaxHeight(),
                 )
                 Spacer(modifier = Modifier.weight(1f))
-                // TODO no feature gate once emoji search PR is implemented!
-                val experimentalEmojiSearch by prefs.emoji.experimentalEmojiSearchEnabled.collectAsState()
-                if (experimentalEmojiSearch) {
-                    SnyggButton(
-                        modifier = Modifier
-                            .minimumInteractiveComponentSize()
-                            .align(Alignment.CenterVertically),
-                        onClick = { isEmojiSearch = true },
-                    ) {
-                        SnyggIcon(
-                            imageVector = Icons.Default.Search,
-                        )
-                        SnyggText(
-                            text = "Search",
-                        )
-                    }
+                SnyggButton(
+                    modifier = Modifier
+                        .minimumInteractiveComponentSize()
+                        .align(Alignment.CenterVertically),
+                    onClick = { isEmojiSearch = true },
+                ) {
+                    SnyggIcon(
+                        imageVector = Icons.Default.Search,
+                    )
+                    SnyggText(
+                        text = "Search",
+                    )
                 }
                 SnyggButton(
                     modifier = Modifier
