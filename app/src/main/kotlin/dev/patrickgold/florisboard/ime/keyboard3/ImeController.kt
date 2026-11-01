@@ -740,7 +740,21 @@ class ImeController(
                 wordTouchEnd = -1
                 return
             }
-            val cursorBefore = state.content.selection.min
+            val content = state.content
+            // k3lp deletes from the text the keyboard knows, so with none it does nothing. Like AOSP LatinIME, send a
+            // delete key press instead and let the app handle it: fields without a text connection, and PIN or code
+            // fields that keep their digits out of the editor, only react to that
+            // The search boxes of the emoji and GIF panels have no input connection and are always edited directly
+            val hasConnection = state.editor.ic.get() != null
+            if (hasConnection && (state.editor.info.isRawInputEditor ||
+                    (content.selection.isCollapsed() && content.surroundingText.textBefore.isEmpty()))
+            ) {
+                state.editor.sendDownUpKeyEvent(KeyEvent.KEYCODE_DEL)
+                wordTouches.clear()
+                wordTouchEnd = -1
+                return
+            }
+            val cursorBefore = content.selection.min
             try {
                 super.emitBackspace()
             } catch (e: Exception) {

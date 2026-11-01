@@ -547,6 +547,59 @@ class LatinSuggestionEngineTest : FunSpec({
         restored.isUserModelDirty shouldBe false
     }
 
+    test("typos typed many times are still corrected, real custom words are kept") {
+        val engine = newEngine()
+        repeat(5) {
+            engine.learn("this", "js")
+            engine.learn("this", "ks")
+            engine.learn("i", "dont")
+            engine.learn("open", "nuvio")
+        }
+        engine.autoCorrect("js", "this ", false, false)?.replacement shouldBe "is"
+        engine.autoCorrect("ks", "this ", false, false)?.replacement shouldBe "is"
+        engine.autoCorrect("dont", "I ", false, false)?.replacement shouldBe "don't"
+        engine.autoCorrect("nuvio", "open ", false, false).shouldBeNull()
+        // A typo typed often does not turn into a suggestion either
+        engine.top("j") shouldNotContain "js"
+    }
+
+    test("undoing a correction keeps the word, also after a restart") {
+        val engine = newEngine()
+        engine.acceptWord("js")
+        engine.autoCorrect("js", "this ", false, false).shouldBeNull()
+        val json = Json.encodeToString(LatinUserModelData.serializer(), engine.exportUserData())
+        val restored = newEngine()
+        restored.importUserData(Json.decodeFromString(LatinUserModelData.serializer(), json))
+        restored.autoCorrect("js", "this ", false, false).shouldBeNull()
+    }
+
+    test("following the top prediction does not loop") {
+        val engine = newEngine()
+        for (start in listOf("the", "I", "this", "thanks")) {
+            val words = mutableListOf(start)
+            repeat(8) {
+                val text = words.joinToString(" ") + " "
+                val recent = LatinTextAnalysis.recentWords(text, LatinSuggestionEngine.PREDICTION_RECENT_WORDS)
+                val next = engine.predictNext(words.last().lowercase(), 3, false, recent).firstOrNull() ?: return@repeat
+                words.add(next)
+            }
+            // No three-word stretch shows up twice
+            val triples = words.map { it.lowercase() }.windowed(3).map { it.joinToString(" ") }
+            triples.size shouldBe triples.toSet().size
+        }
+    }
+
+    test("predicts after contractions") {
+        val engine = newEngine()
+        engine.predictNext("i'm", 3, false).isNotEmpty() shouldBe true
+        engine.predictNext("don't", 3, false).isNotEmpty() shouldBe true
+    }
+
+    test("recent words stop at the start of the sentence") {
+        LatinTextAnalysis.recentWords("Done. I want to go to the", 4) shouldBe setOf("the", "to", "go", "want")
+        LatinTextAnalysis.recentWords("Done. I'm", 4) shouldBe setOf("i'm")
+    }
+
     test("is fast enough to run on every keystroke") {
         val engine = newEngine()
         val inputs = listOf("t", "th", "the", "hel", "helo", "recie", "definatel", "becuase", "q", "xylo")

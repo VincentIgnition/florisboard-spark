@@ -33,6 +33,7 @@ data class LatinUserModelData(
     val bigrams: Map<String, Map<String, Int>> = emptyMap(),
     val casing: Map<String, String> = emptyMap(),
     val blocked: List<String> = emptyList(),
+    val accepted: List<String> = emptyList(),
 )
 
 /**
@@ -102,6 +103,29 @@ object LatinTextAnalysis {
 
     private fun trimQuotes(word: CharSequence): String {
         return word.toString().trim(APOSTROPHE, RIGHT_SINGLE_QUOTE)
+    }
+
+    /**
+     * The last [maxCount] words of the current sentence in [text], lowercased, with apostrophes normalized. Used to
+     * keep next-word predictions from looping back to words just typed.
+     */
+    fun recentWords(text: CharSequence, maxCount: Int): Set<String> {
+        val words = LinkedHashSet<String>()
+        var end = text.length
+        while (end > 0 && words.size < maxCount) {
+            val c = text[end - 1]
+            if (isSentenceEnd(c)) break
+            if (!isWordChar(c)) {
+                end--
+                continue
+            }
+            var start = end
+            while (start > 0 && isWordChar(text[start - 1])) start--
+            val word = trimQuotes(text.subSequence(start, end)).lowercase().replace(RIGHT_SINGLE_QUOTE, APOSTROPHE)
+            if (word.isNotEmpty()) words.add(word)
+            end = start
+        }
+        return words
     }
 
     /**
@@ -329,6 +353,21 @@ class LatinSuggestionEngine(
 
         private const val SPELL_CHECK_MAX_DISTANCE = 1.5
 
+        /** Score taken off a prediction that repeats one of the last few words of the sentence. */
+        private const val PREDICTION_REPEAT_PENALTY = 0.3
+        /** Words that may repeat in predictions without a penalty, since sentences reuse them all the time. */
+        private val FUNCTION_WORDS = hashSetOf(
+            "the", "a", "an", "to", "of", "and", "or", "but", "in", "on", "at", "for", "with", "from", "by", "as",
+            "is", "it", "i", "you", "we", "they", "he", "she", "that", "this", "be", "was", "are", "not", "so",
+            "if", "my", "your", "me", "do", "have", "can", "will", "just",
+        )
+        /** How many of the last words of the sentence count as just typed for predictions. */
+        const val PREDICTION_RECENT_WORDS = 4
+        private val CONTRACTION_TAILS = mapOf(
+            "n't" to "not", "'m" to "am", "'re" to "are", "'ve" to "have", "'ll" to "will", "'d" to "would",
+            "'s" to "is",
+        )
+
         /** How many of the most likely English followers of a word are considered for predictions. */
         private const val PREDICTION_FOLLOWER_LIMIT = 300
 
@@ -422,6 +461,9 @@ class LatinSuggestionEngine(
         const val USER_WORD_MIN_COUNT = 2
         /** Words the user typed this many times, or kept by undoing a correction, are never auto-corrected. */
         const val USER_WORD_PROTECT_COUNT = 3
+        /** A word one slip from a dictionary word at least this frequent counts as a likely typo of it. */
+        private const val LIKELY_TYPO_TARGET_MIN_FREQ = 230
+        private const val LIKELY_TYPO_CACHE_SIZE = 2_000
 
         private val QWERTY_ROWS = listOf("qwertyuiop" to 0.0, "asdfghjkl" to 0.5, "zxcvbnm" to 1.5)
 
@@ -542,6 +584,10 @@ class LatinSuggestionEngine(
     private val userBigrams = HashMap<String, HashMap<String, Int>>()
     private val userCasing = HashMap<String, String>()
     private val blocked = HashSet<String>()
+    /** Words the user kept by undoing a correction of them, protected from autocorrect no matter what. */
+    private val accepted = HashSet<String>()
+    /** Results of [isLikelyTypo], which depend only on the bundled word lists and so never go stale. */
+    private val likelyTypoCache = HashMap<String, Boolean>()
 
     // Touch points of the query being searched, see suggestDetailed. Only set while that search runs.
     private var spatialQuery: String? = null
@@ -606,7 +652,10 @@ class LatinSuggestionEngine(
     private fun isSuggestable(word: String): Boolean {
         if (word in blocked) return false
         if (word.length == 1 && word != "a" && word != "i") return false
-        return word in baseFreq || (userUnigrams[word] ?: 0) >= USER_WORD_MIN_COUNT
+        if (word in baseFreq) return true
+        if ((userUnigrams[word] ?: 0) < USER_WORD_MIN_COUNT) return false
+        // A typo typed a few times ("js") must not start showing up as a suggestion
+        return word in accepted || !isLikelyTypo(word)
     }
 
     private fun isOffensive(word: String): Boolean {
@@ -617,12 +666,16 @@ class LatinSuggestionEngine(
         val freq = baseFreq[word]
         val base = if (freq != null) (freq - minFreq) / freqRange else 0.0
         val userCount = userUnigrams[word] ?: 0
-        val userBoost = if (userCount > 0) min(1.0, ln(1.0 + userCount) / ln(21.0)) else 0.0
+        if (userCount == 0) return base
+        // Typing a typo often must not make it look like a word the user prefers
+        if (isLearnedTypo(word)) return base
+        val userBoost = min(1.0, ln(1.0 + userCount) / ln(21.0))
         return base + USER_WEIGHT * userBoost
     }
 
     private fun bigramScore(previous: String?, word: String): Double {
         if (previous == null) return 0.0
+        if (isLearnedTypo(word)) return 0.0
         val followers = userBigrams[previous] ?: return 0.0
         val count = followers[word] ?: return 0.0
         val total = followers.values.sum().toDouble()
@@ -666,10 +719,44 @@ class LatinSuggestionEngine(
 
     /** True for words the user typed or kept, which auto-correct must leave alone. */
     /**
-     * True for words the user clearly means, typed [USER_WORD_PROTECT_COUNT] times or kept by undoing a correction.
-     * A single use does not count, otherwise a typo that once slipped through would be protected for good.
+     * True for words the user clearly means: kept by undoing a correction, or typed [USER_WORD_PROTECT_COUNT] times
+     * unless the word looks like a typo, so "dont" or "js" typed often are still corrected.
      */
-    private fun isUserWord(word: String): Boolean = (userUnigrams[word] ?: 0) >= USER_WORD_PROTECT_COUNT
+    private fun isUserWord(word: String): Boolean {
+        if (word in accepted) return true
+        return (userUnigrams[word] ?: 0) >= USER_WORD_PROTECT_COUNT && !isLikelyTypo(word)
+    }
+
+    /** True for a likely typo the user has not explicitly kept, whose typing history must not count in its favor. */
+    private fun isLearnedTypo(word: String): Boolean = word !in accepted && isLikelyTypo(word)
+
+    /**
+     * True for a word that is most likely a slip rather than something typed on purpose: an apostrophe-less
+     * contraction ("dont"), or a word that is not a verified real word and is one neighboring-key slip away from a
+     * very common word ("js" and "ks" next to "is").
+     */
+    private fun isLikelyTypo(word: String): Boolean {
+        likelyTypoCache[word]?.let { return it }
+        val result = when {
+            word in contractionsByBareForm -> true
+            (word in baseFreq && word !in unverified) || word in validOnly -> false
+            word.length > MAX_TYPO_INPUT_LENGTH -> false
+            else -> {
+                var nearCommonWord = false
+                forEachWordWithin(word, ADJACENT_SUBSTITUTE_COST, word.length - 1, word.length + 1) { candidate, d ->
+                    if (d > 0.0 && candidate !in unverified &&
+                        (baseFreq[candidate] ?: 0) >= LIKELY_TYPO_TARGET_MIN_FREQ
+                    ) {
+                        nearCommonWord = true
+                    }
+                }
+                nearCommonWord
+            }
+        }
+        if (likelyTypoCache.size >= LIKELY_TYPO_CACHE_SIZE) likelyTypoCache.clear()
+        likelyTypoCache[word] = result
+        return result
+    }
 
     private fun isUnverified(word: String): Boolean = word in unverified && !isUserWord(word)
 
@@ -1465,27 +1552,38 @@ class LatinSuggestionEngine(
      * [previous] in English. At the start of a sentence, common first words fill in until the user's own habits
      * take over.
      */
-    fun predictNext(previous: String?, maxCount: Int, allowPossiblyOffensive: Boolean): List<String> {
+    fun predictNext(
+        previous: String?,
+        maxCount: Int,
+        allowPossiblyOffensive: Boolean,
+        recentWords: Set<String> = emptySet(),
+    ): List<String> {
         if (previous == null || maxCount <= 0) return emptyList()
         val sentenceStart = previous == LatinTextAnalysis.SENTENCE_START
         val scores = HashMap<String, Double>()
         fun offer(word: String, score: Double) {
             if (!isSuggestable(word)) return
             if (!allowPossiblyOffensive && isOffensive(word)) return
-            scores[word] = max(scores[word] ?: Double.NEGATIVE_INFINITY, score)
+            // Words just typed are rarely next again, except function words like "the" and "to". Without this,
+            // following the top prediction loops ("the same time to the same time")
+            val repeat = word in recentWords && word !in FUNCTION_WORDS
+            val adjusted = if (repeat) score - PREDICTION_REPEAT_PENALTY else score
+            scores[word] = max(scores[word] ?: Double.NEGATIVE_INFINITY, adjusted)
         }
         // A small unigram share breaks ties toward common words without outweighing the context
         userBigrams[previous]?.keys?.forEach { word ->
             offer(word, BIGRAM_WEIGHT * bigramScore(previous, word) + 0.1 * unigramScore(word) + 0.2)
         }
-        baseBigrams.followersOf(previous)?.let { followers ->
+        // The word pair data has no apostrophes, so a contraction is predicted from the word it ends with
+        val baseContext = contractionTail(previous) ?: previous
+        baseBigrams.followersOf(baseContext)?.let { followers ->
             // Followers are stored most likely first, the long tail can never reach the top few
             for (index in 0 until min(followers.words.size, PREDICTION_FOLLOWER_LIMIT)) {
                 val word = followers.words[index]
                 offer(
                     word,
-                    BIGRAM_WEIGHT * bigramScore(previous, word) + BASE_BIGRAM_WEIGHT * baseBigramScore(previous, word) +
-                        0.1 * unigramScore(word),
+                    BIGRAM_WEIGHT * bigramScore(previous, word) +
+                        BASE_BIGRAM_WEIGHT * baseBigramScore(baseContext, word) + 0.1 * unigramScore(word),
                 )
             }
         }
@@ -1498,6 +1596,12 @@ class LatinSuggestionEngine(
             .sortedWith(compareByDescending<Map.Entry<String, Double>> { it.value }.thenBy { it.key })
             .take(maxCount)
             .map { applyCase(it.key, "", sentenceStart) }
+    }
+
+    /** The word a contraction ends with ("i'm" ends with "am", "don't" with "not"), or null if it is not one. */
+    private fun contractionTail(word: String): String? {
+        if (!word.contains('\'')) return null
+        return CONTRACTION_TAILS.entries.firstOrNull { word.endsWith(it.key) }?.value
     }
 
     /**
@@ -1565,6 +1669,7 @@ class LatinSuggestionEngine(
         if (word.isEmpty() || word.length > MAX_WORD_LENGTH) return false
         if (word.any { !LatinTextAnalysis.isWordChar(it) }) return false
         blocked.remove(word)
+        accepted.add(word)
         userUnigrams[word] = max(userUnigrams[word] ?: 0, USER_WORD_PROTECT_COUNT)
         isUserModelDirty = true
         return true
@@ -1577,6 +1682,7 @@ class LatinSuggestionEngine(
         val word = normalize(rawWord)
         if (word.isEmpty()) return false
         blocked.add(word)
+        accepted.remove(word)
         userUnigrams.remove(word)
         userCasing.remove(word)
         for (followers in userBigrams.values) {
@@ -1629,6 +1735,7 @@ class LatinSuggestionEngine(
             bigrams = userBigrams.mapValues { (_, followers) -> HashMap(followers) },
             casing = HashMap(userCasing),
             blocked = blocked.sorted(),
+            accepted = accepted.sorted(),
         )
     }
 
@@ -1637,6 +1744,7 @@ class LatinSuggestionEngine(
         userBigrams.clear()
         userCasing.clear()
         blocked.clear()
+        accepted.clear()
         for ((word, count) in data.unigrams) {
             if (word.isNotEmpty() && count > 0) userUnigrams[word] = min(MAX_COUNT, count)
         }
@@ -1649,6 +1757,7 @@ class LatinSuggestionEngine(
         }
         userCasing.putAll(data.casing)
         blocked.addAll(data.blocked)
+        accepted.addAll(data.accepted)
         prune()
         isUserModelDirty = false
     }

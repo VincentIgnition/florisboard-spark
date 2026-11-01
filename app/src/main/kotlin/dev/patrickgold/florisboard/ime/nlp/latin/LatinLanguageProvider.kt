@@ -304,7 +304,8 @@ class LatinLanguageProvider(context: Context) : SpellingProvider, SuggestionProv
             }
             if (currentWord.isEmpty()) {
                 val previous = LatinTextAnalysis.previousWord(textBefore, hasMoreBefore)
-                currentEngine.predictNext(previous, maxCandidateCount, allowPossiblyOffensive)
+                val recentWords = LatinTextAnalysis.recentWords(textBefore, LatinSuggestionEngine.PREDICTION_RECENT_WORDS)
+                currentEngine.predictNext(previous, maxCandidateCount, allowPossiblyOffensive, recentWords)
             } else {
                 val textBeforeWord = textBefore.substring(0, textBefore.length - currentWord.length)
                 // Same decision the keyboard makes when the word is ended, so the bar previews it exactly and the
